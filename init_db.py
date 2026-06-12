@@ -3,7 +3,7 @@ import os
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -14,6 +14,91 @@ from app.models import (
     ResidentAccount, GasStatus
 )
 from app.utils.security import hash_password
+
+
+def ensure_schema_compatible(db):
+    print("\n[1.5/7] 检查并升级数据库 schema...")
+
+    result = db.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'work_orders'
+          AND table_schema = 'public'
+    """)
+    existing_columns = [row[0] for row in result.fetchall()]
+
+    if "is_cross_area" not in existing_columns:
+        print("      ➕ 添加 work_orders.is_cross_area 字段")
+        db.execute("ALTER TABLE work_orders ADD COLUMN is_cross_area BOOLEAN DEFAULT FALSE")
+    else:
+        print("      ✅ work_orders.is_cross_area 已存在")
+
+    if "cross_area_from_area_id" not in existing_columns:
+        print("      ➕ 添加 work_orders.cross_area_from_area_id 字段")
+        db.execute("ALTER TABLE work_orders ADD COLUMN cross_area_from_area_id BIGINT")
+    else:
+        print("      ✅ work_orders.cross_area_from_area_id 已存在")
+
+    result = db.execute("""
+        SELECT constraint_name, constraint_type
+        FROM information_schema.table_constraints
+        WHERE table_name = 'daily_reports'
+          AND table_schema = 'public'
+          AND constraint_type = 'UNIQUE'
+    """)
+    constraints = result.fetchall()
+
+    report_date_unique = None
+    report_date_area_unique = None
+
+    for constraint_name, constraint_type in constraints:
+        col_result = db.execute(f"""
+            SELECT column_name
+            FROM information_schema.key_column_usage
+            WHERE table_name = 'daily_reports'
+              AND table_schema = 'public'
+              AND constraint_name = '{constraint_name}'
+            ORDER BY ordinal_position
+        """)
+        columns = [row[0] for row in col_result.fetchall()]
+        if columns == ["report_date"]:
+            report_date_unique = constraint_name
+        elif set(columns) == {"report_date", "area_id"}:
+            report_date_area_unique = constraint_name
+
+    if report_date_unique:
+        print(f"      🗑️  删除 daily_reports 单独的 report_date 唯一约束")
+        db.execute(f"ALTER TABLE daily_reports DROP CONSTRAINT {report_date_unique}")
+
+    if not report_date_area_unique:
+        print(f"      ➕ 添加 daily_reports (report_date, area_id) 联合唯一约束")
+        db.execute("""
+            ALTER TABLE daily_reports
+            ADD CONSTRAINT uq_report_date_area UNIQUE (report_date, area_id)
+        """)
+    else:
+        print("      ✅ daily_reports 联合唯一约束已存在")
+
+    index_result = db.execute("""
+        SELECT indexname
+        FROM pg_indexes
+        WHERE tablename = 'daily_reports'
+          AND indexname = 'ux_daily_reports_date_global'
+    """)
+    global_index_exists = index_result.scalar()
+
+    if not global_index_exists:
+        print(f"      ➕ 添加 daily_reports 全局日报部分唯一索引")
+        db.execute("""
+            CREATE UNIQUE INDEX ux_daily_reports_date_global
+            ON daily_reports (report_date)
+            WHERE area_id IS NULL
+        """)
+    else:
+        print("      ✅ daily_reports 全局日报部分唯一索引已存在")
+
+    db.flush()
+    print("      Schema 兼容性检查完成")
 
 
 def seed_database():
@@ -27,6 +112,8 @@ def seed_database():
 
     db = SyncSessionLocal()
     try:
+        ensure_schema_compatible(db)
+
         print("\n[2/7] 创建管理员用户...")
         existing_count = db.execute(select(func.count()).select_from(User.__table__)).scalar()
         print(f"      当前已存在 {existing_count} 条用户记录")

@@ -210,6 +210,11 @@ class WorkOrderInfo(WorkOrderBase):
     escalated_at: Optional[datetime] = None
     escalation_count: int = 0
     result: Optional[str] = None
+    is_cross_area: bool = False
+    cross_area_from_area_id: Optional[int] = None
+    cross_area_from_area_name: Optional[str] = None
+    area_name: Optional[str] = None
+    assigned_team_name: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

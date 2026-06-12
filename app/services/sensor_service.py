@@ -4,6 +4,7 @@ from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import and_, func, extract
+from sqlalchemy.dialects.postgresql import insert
 from app.models import (
     SensorReading, Sensor, LeakWarning, WarningLevel,
     PressureStation, ControlLog, Area, WorkOrder,
@@ -131,6 +132,8 @@ async def handle_leak_detection(
             latitude=sensor.latitude,
             level=level,
             status="pending",
+            is_cross_area=False,
+            cross_area_from_area_id=None,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
@@ -143,6 +146,11 @@ async def handle_leak_detection(
             await db.flush()
         except Exception as e:
             logger.error(f"工单分配失败: work_order_id={work_order.id}, error={e}", exc_info=True)
+            work_order.status = "pending"
+            try:
+                await db.flush()
+            except Exception:
+                pass
 
         try:
             if work_order.assignee_id:
@@ -303,14 +311,6 @@ async def predict_demand(
 
 
 async def generate_daily_report(db: AsyncSession, report_date: date, area_id: Optional[int] = None) -> DailyReport:
-    conditions = [DailyReport.report_date == report_date]
-    if area_id is None:
-        conditions.append(DailyReport.area_id.is_(None))
-    else:
-        conditions.append(DailyReport.area_id == area_id)
-    existing = await db.execute(select(DailyReport).where(and_(*conditions)))
-    report = existing.scalar_one_or_none()
-
     start_dt = datetime.combine(report_date, time.min)
     end_dt = start_dt + timedelta(days=1)
 
@@ -404,56 +404,82 @@ async def generate_daily_report(db: AsyncSession, report_date: date, area_id: Op
     )
     revenue = Decimal(str(rev_result.scalar_one_or_none() or 0))
 
-    if report:
-        report.total_gas_volume = total_gas_volume
-        report.peak_hour_volume = peak_hour_volume
-        report.leak_count = leak_count
-        report.leak_resolved = leak_resolved
-        report.leak_detection_rate = leak_detection_rate
-        report.work_order_count = work_order_count
-        report.work_order_completed = work_order_completed
-        report.avg_response_minutes = avg_response
-        report.avg_resolution_minutes = avg_resolution
-        report.overdue_bill_count = overdue_bill_count
-        report.revenue = revenue
-        report.complaint_count = 0
-        report.complaint_rate = Decimal("0")
-        report.new_connection_count = 0
-        await db.flush()
-    else:
-        report = DailyReport(
-            report_date=report_date,
-            area_id=area_id,
-            total_gas_volume=total_gas_volume,
-            peak_hour_volume=peak_hour_volume,
-            leak_count=leak_count,
-            leak_resolved=leak_resolved,
-            leak_detection_rate=leak_detection_rate,
-            work_order_count=work_order_count,
-            work_order_completed=work_order_completed,
-            avg_response_minutes=avg_response,
-            avg_resolution_minutes=avg_resolution,
-            complaint_count=0,
-            complaint_rate=Decimal("0"),
-            new_connection_count=0,
-            overdue_bill_count=overdue_bill_count,
-            revenue=revenue
+    report_data = {
+        "report_date": report_date,
+        "area_id": area_id,
+        "total_gas_volume": total_gas_volume,
+        "peak_hour_volume": peak_hour_volume,
+        "leak_count": leak_count,
+        "leak_resolved": leak_resolved,
+        "leak_detection_rate": leak_detection_rate,
+        "work_order_count": work_order_count,
+        "work_order_completed": work_order_completed,
+        "avg_response_minutes": avg_response,
+        "avg_resolution_minutes": avg_resolution,
+        "complaint_count": 0,
+        "complaint_rate": Decimal("0"),
+        "new_connection_count": 0,
+        "overdue_bill_count": overdue_bill_count,
+        "revenue": revenue
+    }
+
+    stmt = insert(DailyReport).values(**report_data)
+
+    if area_id is not None:
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["report_date", "area_id"],
+            set_={
+                "total_gas_volume": total_gas_volume,
+                "peak_hour_volume": peak_hour_volume,
+                "leak_count": leak_count,
+                "leak_resolved": leak_resolved,
+                "leak_detection_rate": leak_detection_rate,
+                "work_order_count": work_order_count,
+                "work_order_completed": work_order_completed,
+                "avg_response_minutes": avg_response,
+                "avg_resolution_minutes": avg_resolution,
+                "complaint_count": 0,
+                "complaint_rate": Decimal("0"),
+                "new_connection_count": 0,
+                "overdue_bill_count": overdue_bill_count,
+                "revenue": revenue
+            }
         )
-        db.add(report)
-        await db.flush()
+    else:
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["report_date"],
+            index_where=DailyReport.area_id.is_(None),
+            set_={
+                "total_gas_volume": total_gas_volume,
+                "peak_hour_volume": peak_hour_volume,
+                "leak_count": leak_count,
+                "leak_resolved": leak_resolved,
+                "leak_detection_rate": leak_detection_rate,
+                "work_order_count": work_order_count,
+                "work_order_completed": work_order_completed,
+                "avg_response_minutes": avg_response,
+                "avg_resolution_minutes": avg_resolution,
+                "complaint_count": 0,
+                "complaint_rate": Decimal("0"),
+                "new_connection_count": 0,
+                "overdue_bill_count": overdue_bill_count,
+                "revenue": revenue
+            }
+        )
+
+    await db.execute(stmt)
+    await db.flush()
+
+    query_conditions = [DailyReport.report_date == report_date]
+    if area_id is None:
+        query_conditions.append(DailyReport.area_id.is_(None))
+    else:
+        query_conditions.append(DailyReport.area_id == area_id)
+    
+    result = await db.execute(select(DailyReport).where(and_(*query_conditions)))
+    report = result.scalar_one()
 
     await db.commit()
     await db.refresh(report)
-
-    verify_conditions = [DailyReport.report_date == report_date]
-    if area_id is None:
-        verify_conditions.append(DailyReport.area_id.is_(None))
-    else:
-        verify_conditions.append(DailyReport.area_id == area_id)
-    verify_result = await db.execute(select(DailyReport).where(and_(*verify_conditions)))
-    verified = verify_result.scalar_one_or_none()
-    if not verified or verified.id != report.id:
-        logger.error(f"日报生成后校验失败: report_date={report_date}, area_id={area_id}, report_id={report.id}")
-        raise RuntimeError(f"日报生成校验失败，(report_date={report_date}, area_id={area_id}) 组合不存在或不匹配")
 
     return report

@@ -135,12 +135,15 @@ async def assign_work_order(
     assignee_id: Optional[int] = None,
     prefer_area_id: Optional[int] = None
 ) -> WorkOrder:
-    if not team_id and not work_order.team_id:
+    if not team_id and work_order.team_id:
         team_id = work_order.team_id
+
+    is_cross_area = False
+    cross_area_from = None
 
     if not team_id:
         search_area_id = prefer_area_id if prefer_area_id is not None else work_order.area_id
-        team, is_cross_area = await find_nearest_team(
+        team, found_cross_area = await find_nearest_team(
             db,
             search_area_id,
             work_order.longitude,
@@ -150,16 +153,16 @@ async def assign_work_order(
             team_id = team.id
             work_order.team_id = team_id
             team.current_load += 1
+            is_cross_area = found_cross_area
 
-            if is_cross_area and prefer_area_id is not None:
-                work_order.is_cross_area = True
-                work_order.cross_area_from_area_id = prefer_area_id
+            if is_cross_area and search_area_id is not None:
+                cross_area_from = search_area_id
 
                 from_area_result = await db.execute(
-                    select(Area).where(Area.id == prefer_area_id)
+                    select(Area).where(Area.id == search_area_id)
                 )
                 from_area = from_area_result.scalar_one_or_none()
-                from_area_name = from_area.name if from_area else f"ID{prefer_area_id}"
+                from_area_name = from_area.name if from_area else f"ID{search_area_id}"
 
                 to_area_result = await db.execute(
                     select(Area).where(Area.id == team.area_id)
@@ -172,6 +175,39 @@ async def assign_work_order(
                     work_order.description = work_order.description + cross_note
                 else:
                     work_order.description = cross_note.strip()
+    else:
+        team_result = await db.execute(
+            select(MaintenanceTeam).where(MaintenanceTeam.id == team_id)
+        )
+        team = team_result.scalar_one_or_none()
+        if team:
+            check_area_id = prefer_area_id if prefer_area_id is not None else work_order.area_id
+            if check_area_id and team.area_id != check_area_id:
+                is_cross_area = True
+                cross_area_from = check_area_id
+
+                from_area_result = await db.execute(
+                    select(Area).where(Area.id == check_area_id)
+                )
+                from_area = from_area_result.scalar_one_or_none()
+                from_area_name = from_area.name if from_area else f"ID{check_area_id}"
+
+                to_area_result = await db.execute(
+                    select(Area).where(Area.id == team.area_id)
+                )
+                to_area = to_area_result.scalar_one_or_none()
+                to_area_name = to_area.name if to_area else f"ID{team.area_id}"
+
+                cross_note = f"\n\n跨区支援：原区域{from_area_name}，派单至区域{to_area_name}"
+                if work_order.description:
+                    work_order.description = work_order.description + cross_note
+                else:
+                    work_order.description = cross_note.strip()
+
+            if work_order.team_id != team_id:
+                work_order.team_id = team_id
+                if team.current_load < team.max_capacity:
+                    team.current_load += 1
 
     if not assignee_id and team_id:
         user = await find_available_user_in_team(db, team_id)
@@ -193,6 +229,34 @@ async def assign_work_order(
         db.add(assignment)
 
     await db.flush()
+
+    try:
+        async with db.begin_nested():
+            if is_cross_area and cross_area_from is not None:
+                work_order.is_cross_area = True
+                work_order.cross_area_from_area_id = cross_area_from
+            else:
+                work_order.is_cross_area = False
+                work_order.cross_area_from_area_id = None
+
+            await db.flush()
+    except Exception as e:
+        from sqlalchemy.exc import ProgrammingError, IntegrityError
+        if isinstance(e, (ProgrammingError, IntegrityError)):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"数据库缺少 is_cross_area 相关字段，跳过跨区标记: {e}")
+
+            try:
+                if 'is_cross_area' in work_order.__dict__:
+                    del work_order.__dict__['is_cross_area']
+                if 'cross_area_from_area_id' in work_order.__dict__:
+                    del work_order.__dict__['cross_area_from_area_id']
+            except (KeyError, AttributeError):
+                pass
+        else:
+            raise
+
     return work_order
 
 

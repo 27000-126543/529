@@ -1,7 +1,7 @@
 from sqlalchemy import (
     Column, Integer, String, Float, Boolean, DateTime, Text,
     ForeignKey, Index, UniqueConstraint, CheckConstraint,
-    BigInteger, Numeric, Date, Time, JSON, Enum as SAEnum
+    BigInteger, Numeric, Date, Time, JSON, Enum as SAEnum, text
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, ARRAY
@@ -561,6 +561,12 @@ class DailyReport(Base):
 
     __table_args__ = (
         UniqueConstraint("report_date", "area_id", name="uq_report_date_area"),
+        Index(
+            "ux_daily_reports_date_global",
+            "report_date",
+            unique=True,
+            postgresql_where=text("area_id IS NULL")
+        ),
     )
 
 

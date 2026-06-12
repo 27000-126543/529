@@ -4,6 +4,7 @@ from decimal import Decimal
 import random
 import calendar
 from sqlalchemy import select, and_, func, cast, Date, extract, Integer
+from sqlalchemy.dialects.postgresql import insert
 from app.database import SyncSessionLocal
 from app.models import (
     DailyReport, Area, User, UserRole, NotificationType,
@@ -124,7 +125,7 @@ def _get_overdue_bill_count(db, report_date, area_id=None):
     ).where(
         and_(
             Bill.due_date < report_date,
-            Bill.status != "paid"
+            Bill.status == "overdue"
         )
     )
     if area_id:
@@ -151,61 +152,79 @@ def _get_revenue(db, report_date, area_id=None):
 
 
 def _upsert_daily_report(db, report_date, area_id, stats):
-    conditions = [DailyReport.report_date == report_date]
-    if area_id is None:
-        conditions.append(DailyReport.area_id.is_(None))
-    else:
-        conditions.append(DailyReport.area_id == area_id)
-    existing = db.execute(
-        select(DailyReport).where(and_(*conditions))
-    ).scalar_one_or_none()
-    if existing:
-        existing.total_gas_volume = stats["total_gas_volume"]
-        existing.peak_hour_volume = stats["peak_hour_volume"]
-        existing.leak_count = stats["leak_count"]
-        existing.leak_resolved = stats["leak_resolved"]
-        existing.leak_detection_rate = stats["leak_detection_rate"]
-        existing.work_order_count = stats["work_order_count"]
-        existing.work_order_completed = stats["work_order_completed"]
-        existing.avg_response_minutes = stats["avg_response_minutes"]
-        existing.avg_resolution_minutes = stats["avg_resolution_minutes"]
-        existing.overdue_bill_count = stats["overdue_bill_count"]
-        existing.revenue = stats["revenue"]
-        existing.complaint_count = 0
-        existing.complaint_rate = Decimal("0")
-        existing.new_connection_count = 0
-        report = existing
-    else:
-        report = DailyReport(
-            report_date=report_date,
-            area_id=area_id,
-            total_gas_volume=stats["total_gas_volume"],
-            peak_hour_volume=stats["peak_hour_volume"],
-            leak_count=stats["leak_count"],
-            leak_resolved=stats["leak_resolved"],
-            leak_detection_rate=stats["leak_detection_rate"],
-            work_order_count=stats["work_order_count"],
-            work_order_completed=stats["work_order_completed"],
-            avg_response_minutes=stats["avg_response_minutes"],
-            avg_resolution_minutes=stats["avg_resolution_minutes"],
-            complaint_count=0,
-            complaint_rate=Decimal("0"),
-            new_connection_count=0,
-            overdue_bill_count=stats["overdue_bill_count"],
-            revenue=stats["revenue"]
-        )
-        db.add(report)
-        db.flush()
+    report_data = {
+        "report_date": report_date,
+        "area_id": area_id,
+        "total_gas_volume": stats["total_gas_volume"],
+        "peak_hour_volume": stats["peak_hour_volume"],
+        "leak_count": stats["leak_count"],
+        "leak_resolved": stats["leak_resolved"],
+        "leak_detection_rate": stats["leak_detection_rate"],
+        "work_order_count": stats["work_order_count"],
+        "work_order_completed": stats["work_order_completed"],
+        "avg_response_minutes": stats["avg_response_minutes"],
+        "avg_resolution_minutes": stats["avg_resolution_minutes"],
+        "complaint_count": 0,
+        "complaint_rate": Decimal("0"),
+        "new_connection_count": 0,
+        "overdue_bill_count": stats["overdue_bill_count"],
+        "revenue": stats["revenue"]
+    }
 
-    verify_conditions = [DailyReport.report_date == report_date]
-    if area_id is None:
-        verify_conditions.append(DailyReport.area_id.is_(None))
+    stmt = insert(DailyReport).values(**report_data)
+
+    if area_id is not None:
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["report_date", "area_id"],
+            set_={
+                "total_gas_volume": stats["total_gas_volume"],
+                "peak_hour_volume": stats["peak_hour_volume"],
+                "leak_count": stats["leak_count"],
+                "leak_resolved": stats["leak_resolved"],
+                "leak_detection_rate": stats["leak_detection_rate"],
+                "work_order_count": stats["work_order_count"],
+                "work_order_completed": stats["work_order_completed"],
+                "avg_response_minutes": stats["avg_response_minutes"],
+                "avg_resolution_minutes": stats["avg_resolution_minutes"],
+                "complaint_count": 0,
+                "complaint_rate": Decimal("0"),
+                "new_connection_count": 0,
+                "overdue_bill_count": stats["overdue_bill_count"],
+                "revenue": stats["revenue"]
+            }
+        )
     else:
-        verify_conditions.append(DailyReport.area_id == area_id)
-    verified = db.execute(select(DailyReport).where(and_(*verify_conditions))).scalar_one_or_none()
-    if not verified or verified.id != report.id:
-        logger.error(f"日报生成后校验失败: report_date={report_date}, area_id={area_id}, report_id={report.id}")
-        raise RuntimeError(f"日报生成校验失败，(report_date={report_date}, area_id={area_id}) 组合不存在或不匹配")
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["report_date"],
+            index_where=DailyReport.area_id.is_(None),
+            set_={
+                "total_gas_volume": stats["total_gas_volume"],
+                "peak_hour_volume": stats["peak_hour_volume"],
+                "leak_count": stats["leak_count"],
+                "leak_resolved": stats["leak_resolved"],
+                "leak_detection_rate": stats["leak_detection_rate"],
+                "work_order_count": stats["work_order_count"],
+                "work_order_completed": stats["work_order_completed"],
+                "avg_response_minutes": stats["avg_response_minutes"],
+                "avg_resolution_minutes": stats["avg_resolution_minutes"],
+                "complaint_count": 0,
+                "complaint_rate": Decimal("0"),
+                "new_connection_count": 0,
+                "overdue_bill_count": stats["overdue_bill_count"],
+                "revenue": stats["revenue"]
+            }
+        )
+
+    db.execute(stmt)
+    db.flush()
+
+    query_conditions = [DailyReport.report_date == report_date]
+    if area_id is None:
+        query_conditions.append(DailyReport.area_id.is_(None))
+    else:
+        query_conditions.append(DailyReport.area_id == area_id)
+    
+    report = db.execute(select(DailyReport).where(and_(*query_conditions))).scalar_one()
 
     return report
 

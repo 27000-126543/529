@@ -113,7 +113,7 @@ def check_overdue_work_orders():
         result = db.execute(
             select(WorkOrder).where(
                 and_(
-                    WorkOrder.status.in_(["pending", "assigned", "accepted"]),
+                    WorkOrder.status.in_(["pending", "assigned", "in_progress"]),
                     WorkOrder.created_at < threshold,
                     or_(
                         WorkOrder.escalation_count == 0,
@@ -147,6 +147,20 @@ def check_overdue_work_orders():
 
                 if wo.area_id:
                     new_team = _find_team_for_area(db, wo.area_id)
+                    if not new_team:
+                        areas_result = db.execute(
+                            select(Area).where(Area.parent_id == (
+                                select(Area.parent_id).where(Area.id == wo.area_id).scalar_subquery()
+                            ))
+                        )
+                        sibling_areas = list(areas_result.scalars().all())
+                        for sibling_area in sibling_areas:
+                            if sibling_area.id != wo.area_id:
+                                new_team = _find_team_for_area(db, sibling_area.id)
+                                if new_team:
+                                    wo.is_cross_area = True
+                                    wo.cross_area_from_area_id = wo.area_id
+                                    break
                     if new_team:
                         wo.team_id = new_team.id
                         new_team.current_load += 1

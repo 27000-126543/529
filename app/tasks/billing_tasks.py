@@ -234,13 +234,12 @@ def check_overdue_bills():
     try:
         now = datetime.utcnow()
         today = date.today()
-        cutoff = today - timedelta(days=settings.BILL_OVERDUE_DAYS)
 
         bills_result = db.execute(
             select(Bill).where(
                 and_(
-                    Bill.due_date < cutoff,
-                    Bill.status.in_(["unpaid", "partial"]),
+                    Bill.due_date < today,
+                    Bill.status == "unpaid",
                     Bill.restriction_issued == False
                 )
             )
@@ -276,7 +275,7 @@ def check_overdue_bills():
                 collector_result = db.execute(
                     select(User).where(
                         and_(User.role == UserRole.COLLECTOR, User.is_active == True)
-                    )
+                    ).order_by(User.id.asc())
                 )
                 collectors = list(collector_result.scalars().all())
                 if collectors:

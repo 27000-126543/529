@@ -9,7 +9,7 @@ from sqlalchemy import and_, func, or_
 from app.database import get_db
 from app.models import (
     Sensor, SensorType, PressureStation, ControlLog, LeakWarning, WarningLevel,
-    User, UserRole, WorkOrder, WorkOrderStatus, WorkOrderType, Area
+    User, UserRole, WorkOrder, WorkOrderStatus, WorkOrderType, Area, MaintenanceTeam
 )
 from app.schemas.sensor import (
     SensorCreate, SensorUpdate, SensorInfo, SensorListResponse,
@@ -463,6 +463,7 @@ async def list_work_orders(
     mine: bool = False,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    is_cross_area: Optional[bool] = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -491,6 +492,9 @@ async def list_work_orders(
     elif current_user.area_id and current_user.role in [UserRole.AREA_MANAGER]:
         query = query.where(WorkOrder.area_id == current_user.area_id)
 
+    if is_cross_area is not None:
+        query = query.where(WorkOrder.is_cross_area == is_cross_area)
+
     if start_date:
         query = query.where(func.date(WorkOrder.created_at) >= start_date)
     if end_date:
@@ -500,12 +504,43 @@ async def list_work_orders(
     query = query.order_by(WorkOrder.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
     items = (await db.execute(query)).scalars().all()
 
+    area_ids = set()
+    team_ids = set()
+    for wo in items:
+        if wo.area_id:
+            area_ids.add(wo.area_id)
+        if wo.cross_area_from_area_id:
+            area_ids.add(wo.cross_area_from_area_id)
+        if wo.team_id:
+            team_ids.add(wo.team_id)
+
+    area_name_map = {}
+    if area_ids:
+        area_result = await db.execute(select(Area).where(Area.id.in_(list(area_ids))))
+        areas = area_result.scalars().all()
+        area_name_map = {a.id: a.name for a in areas}
+
+    team_name_map = {}
+    if team_ids:
+        team_result = await db.execute(select(MaintenanceTeam).where(MaintenanceTeam.id.in_(list(team_ids))))
+        teams = team_result.scalars().all()
+        team_name_map = {t.id: t.name for t in teams}
+
+    result_items = []
+    for wo in items:
+        wo_info = WorkOrderInfo.model_validate(wo)
+        wo_info.area_name = area_name_map.get(wo.area_id)
+        wo_info.assigned_team_name = team_name_map.get(wo.team_id)
+        if wo.is_cross_area and wo.cross_area_from_area_id:
+            wo_info.cross_area_from_area_name = area_name_map.get(wo.cross_area_from_area_id)
+        result_items.append(wo_info)
+
     return WorkOrderListResponse(
         total=total,
         page=page,
         page_size=page_size,
         total_pages=(total + page_size - 1) // page_size,
-        items=[WorkOrderInfo.model_validate(w) for w in items]
+        items=result_items
     )
 
 
@@ -515,7 +550,28 @@ async def get_work_order(order_id: int, db: AsyncSession = Depends(get_db)):
     wo = result.scalar_one_or_none()
     if not wo:
         raise HTTPException(status_code=404, detail="工单不存在")
-    return WorkOrderInfo.model_validate(wo)
+
+    wo_info = WorkOrderInfo.model_validate(wo)
+
+    if wo.area_id:
+        area_result = await db.execute(select(Area).where(Area.id == wo.area_id))
+        area = area_result.scalar_one_or_none()
+        if area:
+            wo_info.area_name = area.name
+
+    if wo.is_cross_area and wo.cross_area_from_area_id:
+        from_area_result = await db.execute(select(Area).where(Area.id == wo.cross_area_from_area_id))
+        from_area = from_area_result.scalar_one_or_none()
+        if from_area:
+            wo_info.cross_area_from_area_name = from_area.name
+
+    if wo.team_id:
+        team_result = await db.execute(select(MaintenanceTeam).where(MaintenanceTeam.id == wo.team_id))
+        team = team_result.scalar_one_or_none()
+        if team:
+            wo_info.assigned_team_name = team.name
+
+    return wo_info
 
 
 @work_order_router.post("/{order_id}/assign", response_model=SuccessResponse, dependencies=[Depends(require_roles(UserRole.DISPATCHER, UserRole.ADMIN, UserRole.AREA_MANAGER))])
