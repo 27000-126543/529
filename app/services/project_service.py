@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,11 +6,12 @@ from sqlalchemy.future import select
 from sqlalchemy import and_, func
 from app.models import (
     EngineeringProject, ApprovalRecord, ApprovalStage, ApprovalStatus,
-    MaintenanceTeam, ResidentReport, WorkOrderType
+    MaintenanceTeam, ResidentReport, WorkOrderType,
+    User, UserRole, NotificationType
 )
 from app.utils.security import generate_order_no
 from app.config import settings
-from app.services import work_order_service
+from app.services import work_order_service, notification_service
 
 
 async def create_project(
@@ -40,20 +41,37 @@ async def create_project(
 
 
 async def create_approval_records(db: AsyncSession, project: EngineeringProject):
-    stages = [
+    stages_order = [
         ApprovalStage.SAFETY,
         ApprovalStage.DESIGN,
         ApprovalStage.ENGINEERING,
         ApprovalStage.FINAL
     ]
-    for stage in stages:
+
+    safety_inspector_result = await db.execute(
+        select(User.id).where(
+            and_(
+                User.role == UserRole.SAFETY_INSPECTOR,
+                User.is_active == True
+            )
+        ).limit(1)
+    )
+    safety_inspector_id = safety_inspector_result.scalar_one_or_none()
+
+    for stage in stages_order:
+        approver_id = 0
+        if stage == ApprovalStage.SAFETY and safety_inspector_id:
+            approver_id = safety_inspector_id
+
         record = ApprovalRecord(
             project_id=project.id,
             stage=stage,
-            approver_id=0,
-            status=ApprovalStatus.PENDING if stage == ApprovalStage.SAFETY else ApprovalStatus.PENDING
+            approver_id=approver_id,
+            status=ApprovalStatus.PENDING,
+            submitted_at=datetime.utcnow()
         )
         db.add(record)
+
     await db.flush()
 
 
@@ -83,35 +101,80 @@ async def approve_stage(
     record.approved_at = datetime.utcnow()
     await db.flush()
 
+    project_result = await db.execute(
+        select(EngineeringProject).where(EngineeringProject.id == project_id)
+    )
+    project = project_result.scalar_one_or_none()
+    if not project:
+        await db.flush()
+        return record
+
+    stages_order = [
+        ApprovalStage.SAFETY,
+        ApprovalStage.DESIGN,
+        ApprovalStage.ENGINEERING,
+        ApprovalStage.FINAL
+    ]
+
+    stage_role_map = {
+        ApprovalStage.SAFETY: UserRole.SAFETY_INSPECTOR,
+        ApprovalStage.DESIGN: UserRole.DESIGNER,
+        ApprovalStage.ENGINEERING: UserRole.ENGINEER,
+        ApprovalStage.FINAL: [UserRole.DISPATCHER, UserRole.ADMIN]
+    }
+
     if status == ApprovalStatus.APPROVED:
-        project_result = await db.execute(
-            select(EngineeringProject).where(EngineeringProject.id == project_id)
-        )
-        project = project_result.scalar_one_or_none()
-        if project:
-            stages_order = [
-                ApprovalStage.SAFETY,
-                ApprovalStage.DESIGN,
-                ApprovalStage.ENGINEERING,
-                ApprovalStage.FINAL
-            ]
-            current_idx = stages_order.index(stage)
-            if current_idx < len(stages_order) - 1:
-                project.current_stage = stages_order[current_idx + 1]
-                project.approval_status = ApprovalStatus.PENDING
-            else:
-                project.approval_status = ApprovalStatus.APPROVED
-                project.status = "approved"
-                await assign_construction_team(db, project)
+        current_idx = stages_order.index(stage)
+        if current_idx < len(stages_order) - 1:
+            next_stage = stages_order[current_idx + 1]
+            project.current_stage = next_stage
+            project.approval_status = ApprovalStatus.PENDING
+
+            required_role = stage_role_map.get(next_stage)
+            next_approver_id = 0
+
+            if required_role:
+                if isinstance(required_role, list):
+                    role_result = await db.execute(
+                        select(User.id).where(
+                            and_(
+                                User.role.in_(required_role),
+                                User.is_active == True
+                            )
+                        ).limit(1)
+                    )
+                else:
+                    role_result = await db.execute(
+                        select(User.id).where(
+                            and_(
+                                User.role == required_role,
+                                User.is_active == True
+                            )
+                        ).limit(1)
+                    )
+                found_id = role_result.scalar_one_or_none()
+                if found_id:
+                    next_approver_id = found_id
+
+            next_record_result = await db.execute(
+                select(ApprovalRecord).where(
+                    and_(
+                        ApprovalRecord.project_id == project_id,
+                        ApprovalRecord.stage == next_stage
+                    )
+                )
+            )
+            next_record = next_record_result.scalar_one_or_none()
+            if next_record:
+                next_record.approver_id = next_approver_id
+        else:
+            project.approval_status = ApprovalStatus.APPROVED
+            project.status = "approved"
+            await assign_construction_team(db, project)
 
     elif status == ApprovalStatus.REJECTED:
-        project_result = await db.execute(
-            select(EngineeringProject).where(EngineeringProject.id == project_id)
-        )
-        project = project_result.scalar_one_or_none()
-        if project:
-            project.approval_status = ApprovalStatus.REJECTED
-            project.status = "rejected"
+        project.approval_status = ApprovalStatus.REJECTED
+        project.status = "rejected"
 
     await db.flush()
     return record
@@ -132,13 +195,19 @@ async def assign_construction_team(
     team = team_result.scalar_one_or_none()
     if team:
         project.construction_team_id = team.id
-        team.current_load += 1
+        if not project.planned_start_date:
+            project.actual_start_date = date.today() + timedelta(days=3)
+        else:
+            project.actual_start_date = project.planned_start_date
         project.status = "scheduled"
+        team.current_load += 1
         await db.flush()
 
 
 async def check_and_remind_approvals(db: AsyncSession) -> int:
     threshold = datetime.utcnow() - timedelta(hours=settings.APPROVAL_TIMEOUT_HOURS)
+    now = datetime.utcnow()
+
     result = await db.execute(
         select(ApprovalRecord).where(
             and_(
@@ -151,11 +220,43 @@ async def check_and_remind_approvals(db: AsyncSession) -> int:
 
     reminded = 0
     for rec in records:
-        last_remind = rec.last_reminded_at or rec.submitted_at
-        if last_remind and (datetime.utcnow() - last_remind).total_seconds() >= 3600:
+        should_remind = False
+        if rec.last_reminded_at is None:
+            should_remind = True
+        else:
+            elapsed = (now - rec.last_reminded_at).total_seconds()
+            if elapsed >= 3600:
+                should_remind = True
+
+        if should_remind:
             rec.reminder_count += 1
-            rec.last_reminded_at = datetime.utcnow()
+            rec.last_reminded_at = now
             reminded += 1
+
+            if rec.approver_id and rec.approver_id > 0:
+                project_result = await db.execute(
+                    select(EngineeringProject).where(
+                        EngineeringProject.id == rec.project_id
+                    )
+                )
+                project = project_result.scalar_one_or_none()
+                project_name = project.name if project else "未知项目"
+                stage_label = {
+                    ApprovalStage.SAFETY: "安监",
+                    ApprovalStage.DESIGN: "设计",
+                    ApprovalStage.ENGINEERING: "工程",
+                    ApprovalStage.FINAL: "终审"
+                }.get(rec.stage, rec.stage.value)
+
+                await notification_service.create_notification(
+                    db,
+                    rec.approver_id,
+                    NotificationType.APPROVAL,
+                    f"【审批提醒】{stage_label}审批待处理",
+                    f"项目《{project_name}》的{stage_label}审批已超时，请尽快处理。项目编号：{project.project_no if project else 'N/A'}",
+                    rec.project_id,
+                    "engineering_project"
+                )
 
     await db.flush()
     return reminded

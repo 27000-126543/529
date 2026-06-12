@@ -1,14 +1,14 @@
 from typing import Optional, List, Dict
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time
 from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import and_, func, cast, Date as SADate
+from sqlalchemy import and_, func, extract
 from app.models import (
     SensorReading, Sensor, LeakWarning, WarningLevel,
     PressureStation, ControlLog, Area, WorkOrder,
     WorkOrderStatus, ResidentReport, Bill, DailyReport,
-    ResidentAccount, GasStatus
+    ResidentAccount, GasStatus, BillStatus
 )
 from app.config import settings
 import json
@@ -87,6 +87,92 @@ async def handle_leak_detection(
     )
     db.add(warning)
     await db.flush()
+
+    from app.services.work_order_service import create_work_order as create_wo
+    from app.services import notification_service
+    from app.models import WorkOrderType, NotificationType, WorkOrder, UserRole, Area
+    from app.utils.security import generate_order_no
+    from datetime import datetime as dt
+    from sqlalchemy import func
+
+    level_label = {
+        WarningLevel.LEVEL_1: "一级",
+        WarningLevel.LEVEL_2: "二级",
+        WarningLevel.LEVEL_3: "三级",
+        WarningLevel.LEVEL_4: "四级(紧急)"
+    }.get(level, "一般")
+
+    priority = 1
+    if level in (WarningLevel.LEVEL_3, WarningLevel.LEVEL_4):
+        priority = 1
+    elif level == WarningLevel.LEVEL_2:
+        priority = 2
+    else:
+        priority = 3
+
+    wo_order_no = generate_order_no("WO")
+    work_order = WorkOrder(
+        order_no=wo_order_no,
+        type=WorkOrderType.LEAK_REPAIR,
+        title=f"[{level_label}泄漏抢修] 传感器{sensor.code}",
+        description=f"传感器:{sensor.name}(编码:{sensor.code})检测到燃气泄漏\n浓度值:{concentration}\n预警级别:{level_label}\n现场地址: 经度{sensor.longitude}, 纬度{sensor.latitude}",
+        warning_id=warning.id,
+        area_id=sensor.area_id,
+        priority=priority,
+        longitude=sensor.longitude,
+        latitude=sensor.latitude,
+        level=level,
+        status="pending",
+        created_at=dt.utcnow(),
+        updated_at=dt.utcnow()
+    )
+    db.add(work_order)
+    await db.flush()
+
+    from app.services.work_order_service import assign_work_order, find_nearest_team, find_available_user_in_team
+
+    await assign_work_order(db, work_order)
+    await db.flush()
+
+    if work_order.assignee_id:
+        await notification_service.create_notification(
+            db,
+            work_order.assignee_id,
+            NotificationType.WARNING,
+            f"【紧急】{level_label}泄漏抢修工单已分配",
+            f"工单:{work_order.order_no} 位置:传感器{sensor.code} 浓度:{concentration}",
+            work_order.id,
+            "work_order"
+        )
+
+    if sensor.area_id:
+        area_q = await db.execute(select(Area).where(Area.id == sensor.area_id))
+        area = area_q.scalar_one_or_none()
+        if area and area.manager_id:
+            await notification_service.create_notification(
+                db,
+                area.manager_id,
+                NotificationType.WARNING,
+                f"【区域预警】{level_label}泄漏事件 - {area.name}",
+                f"传感器:{sensor.code} 浓度:{concentration} 已生成工单:{work_order.order_no}",
+                warning.id,
+                "leak_warning"
+            )
+
+    dispatcher_ids_q = await db.execute(
+        select(User.id).where(User.role == UserRole.DISPATCHER, User.is_active == True)
+    )
+    dispatcher_ids = dispatcher_ids_q.scalars().all()
+    for did in list(dispatcher_ids)[:5]:
+        await notification_service.create_notification(
+            db,
+            did,
+            NotificationType.WARNING,
+            f"【调度】{level_label}泄漏事件",
+            f"传感器:{sensor.code} 工单:{work_order.order_no} 已派给: ID{work_order.assignee_id}",
+            warning.id,
+            "leak_warning"
+        )
 
     return warning
 
@@ -213,100 +299,118 @@ async def generate_daily_report(db: AsyncSession, report_date: date, area_id: Op
     if report:
         return report
 
-    next_day = report_date + timedelta(days=1)
+    start_dt = datetime.combine(report_date, time.min)
+    end_dt = start_dt + timedelta(days=1)
 
-    total_volume = Decimal("0")
+    flow_conditions = [
+        Sensor.type == "flow",
+        SensorReading.reading_time >= start_dt,
+        SensorReading.reading_time < end_dt
+    ]
+    if area_id:
+        flow_conditions.append(Sensor.area_id == area_id)
+
     flow_result = await db.execute(
         select(func.sum(SensorReading.value)).select_from(
             SensorReading
         ).join(Sensor, Sensor.id == SensorReading.sensor_id).where(
-            and_(
-                Sensor.type == "flow",
-                SensorReading.reading_time >= datetime.combine(report_date, datetime.min.time()),
-                SensorReading.reading_time < datetime.combine(next_day, datetime.min.time()),
-                (Sensor.area_id == area_id) if area_id else True
-            )
+            and_(*flow_conditions)
         )
     )
-    if flow_result.scalar_one_or_none():
-        total_volume = Decimal(str(flow_result.scalar_one() or 0))
+    total_gas_volume = Decimal(str(flow_result.scalar_one_or_none() or 0))
 
-    peak_vol = Decimal("0")
-    for h in settings.PEAK_HOURS:
-        pass
+    peak_conditions = [
+        Sensor.type == "flow",
+        SensorReading.reading_time >= start_dt,
+        SensorReading.reading_time < end_dt,
+        extract("hour", SensorReading.reading_time).in_(settings.PEAK_HOURS)
+    ]
+    if area_id:
+        peak_conditions.append(Sensor.area_id == area_id)
 
-    leak_query = select(LeakWarning).where(
-        and_(
-            func.date(LeakWarning.created_at) == report_date,
-            (LeakWarning.area_id == area_id) if area_id else True
+    peak_result = await db.execute(
+        select(func.sum(SensorReading.value)).select_from(
+            SensorReading
+        ).join(Sensor, Sensor.id == SensorReading.sensor_id).where(
+            and_(*peak_conditions)
         )
     )
+    peak_hour_volume = Decimal(str(peak_result.scalar_one_or_none() or 0))
+
+    leak_conditions = [func.date(LeakWarning.created_at) == report_date]
+    if area_id:
+        leak_conditions.append(LeakWarning.area_id == area_id)
+
+    leak_query = select(LeakWarning).where(and_(*leak_conditions))
     leak_result = await db.execute(leak_query)
     all_leaks = leak_result.scalars().all()
     leak_count = len(all_leaks)
     leak_resolved = sum(1 for w in all_leaks if w.status != "active")
+    leak_detection_rate = Decimal(str(100.0 * leak_resolved / leak_count)) if leak_count > 0 else Decimal("0")
 
-    leak_detection_rate = Decimal(str(leak_resolved / leak_count * 100)) if leak_count > 0 else Decimal("100")
+    wo_conditions = [func.date(WorkOrder.created_at) == report_date]
+    if area_id:
+        wo_conditions.append(WorkOrder.area_id == area_id)
 
-    wo_query = select(WorkOrder).where(
-        and_(
-            func.date(WorkOrder.created_at) == report_date,
-            (WorkOrder.area_id == area_id) if area_id else True
-        )
-    )
+    wo_query = select(WorkOrder).where(and_(*wo_conditions))
     wo_result = await db.execute(wo_query)
     all_wos = wo_result.scalars().all()
-    wo_count = len(all_wos)
-    wo_completed = sum(1 for w in all_wos if w.status == WorkOrderStatus.COMPLETED)
+    work_order_count = len(all_wos)
+    work_order_completed = sum(1 for w in all_wos if w.status == WorkOrderStatus.COMPLETED)
 
-    resp_times = [w.response_minutes for w in all_wos if w.response_minutes]
-    res_times = [w.resolution_minutes for w in all_wos if w.resolution_minutes]
-    avg_resp = Decimal(str(sum(resp_times) / len(resp_times))) if resp_times else Decimal("0")
-    avg_res = Decimal(str(sum(res_times) / len(res_times))) if res_times else Decimal("0")
+    resp_times = [w.response_minutes for w in all_wos if w.response_minutes is not None]
+    res_times = [w.resolution_minutes for w in all_wos if w.resolution_minutes is not None]
+    avg_response = Decimal(str(sum(resp_times) / len(resp_times))) if resp_times else Decimal("0")
+    avg_resolution = Decimal(str(sum(res_times) / len(res_times))) if res_times else Decimal("0")
+
+    overdue_conditions = [
+        Bill.due_date < report_date,
+        Bill.status != BillStatus.PAID
+    ]
+    if area_id:
+        overdue_conditions.append(ResidentAccount.area_id == area_id)
 
     bill_result = await db.execute(
         select(func.count(Bill.id)).select_from(
             Bill
         ).join(ResidentAccount, ResidentAccount.id == Bill.account_id).where(
-            and_(
-                Bill.due_date < report_date,
-                Bill.status.in_(["unpaid", "partial", "overdue"]),
-                (ResidentAccount.area_id == area_id) if area_id else True
-            )
+            and_(*overdue_conditions)
         )
     )
-    overdue_count = bill_result.scalar_one() or 0
+    overdue_bill_count = bill_result.scalar_one() or 0
+
+    revenue_conditions = [func.date(Bill.paid_at) == report_date]
+    if area_id:
+        revenue_conditions.append(ResidentAccount.area_id == area_id)
 
     rev_result = await db.execute(
         select(func.sum(Bill.paid_amount)).select_from(
             Bill
         ).join(ResidentAccount, ResidentAccount.id == Bill.account_id).where(
-            and_(
-                func.date(Bill.paid_at) == report_date if Bill.paid_at else False,
-                (ResidentAccount.area_id == area_id) if area_id else True
-            )
+            and_(*revenue_conditions)
         )
     )
-    revenue = Decimal(str(rev_result.scalar_one() or 0))
+    revenue = Decimal(str(rev_result.scalar_one_or_none() or 0))
 
     report = DailyReport(
         report_date=report_date,
         area_id=area_id,
-        total_gas_volume=total_volume,
-        peak_hour_volume=peak_vol,
+        total_gas_volume=total_gas_volume,
+        peak_hour_volume=peak_hour_volume,
         leak_count=leak_count,
         leak_resolved=leak_resolved,
         leak_detection_rate=leak_detection_rate,
-        work_order_count=wo_count,
-        work_order_completed=wo_completed,
-        avg_response_minutes=avg_resp,
-        avg_resolution_minutes=avg_res,
+        work_order_count=work_order_count,
+        work_order_completed=work_order_completed,
+        avg_response_minutes=avg_response,
+        avg_resolution_minutes=avg_resolution,
         complaint_count=0,
         complaint_rate=Decimal("0"),
         new_connection_count=0,
-        overdue_bill_count=overdue_count,
+        overdue_bill_count=overdue_bill_count,
         revenue=revenue
     )
     db.add(report)
-    await db.flush()
+    await db.commit()
+    await db.refresh(report)
     return report

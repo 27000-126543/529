@@ -1,28 +1,116 @@
 from celery import shared_task
 from datetime import datetime, date, timedelta
 from decimal import Decimal
+from sqlalchemy import select, and_, or_, desc, func
 from app.database import SyncSessionLocal
 from app.models import (
-    WorkOrder, WorkOrderStatus, User, UserRole, Area,
+    WorkOrder, WorkOrderStatus, WorkOrderAssignment,
+    MaintenanceTeam, User, UserRole, Area, WarningLevel,
     ApprovalRecord, ApprovalStatus, NotificationType,
-    PressureStation, Sensor, SensorReading
+    Notification, PressureStation, Sensor, SensorReading,
+    SensorType, ControlLog
 )
-from app.services import work_order_service, project_service, notification_service, sensor_service
 from app.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
+def _create_notification_sync(db, user_id, type, title, content=None, related_id=None, related_type=None):
+    notification = Notification(
+        user_id=user_id,
+        type=type,
+        title=title,
+        content=content,
+        related_id=related_id,
+        related_type=related_type,
+        is_read=False
+    )
+    db.add(notification)
+    db.flush()
+    return notification
+
+
+def _get_dispatchers(db, limit=5):
+    result = db.execute(
+        select(User.id).where(
+            and_(User.role == UserRole.DISPATCHER, User.is_active == True)
+        )
+    )
+    return list(result.scalars().all())[:limit]
+
+
+def _escalate_level(current_level):
+    if current_level == WarningLevel.LEVEL_1:
+        return WarningLevel.LEVEL_2
+    elif current_level == WarningLevel.LEVEL_2:
+        return WarningLevel.LEVEL_3
+    else:
+        return WarningLevel.LEVEL_4
+
+
+def _find_team_for_area(db, area_id):
+    result = db.execute(
+        select(MaintenanceTeam).where(
+            and_(
+                MaintenanceTeam.area_id == area_id,
+                MaintenanceTeam.status == "active",
+                MaintenanceTeam.current_load < MaintenanceTeam.max_capacity
+            )
+        )
+    )
+    teams = list(result.scalars().all())
+    if not teams:
+        return None
+    scored = []
+    for team in teams:
+        load_ratio = team.current_load / max(team.max_capacity, 1)
+        scored.append((load_ratio, team))
+    scored.sort(key=lambda x: x[0])
+    return scored[0][1]
+
+
+def _find_available_user_in_team(db, team_id):
+    result = db.execute(
+        select(User).where(
+            and_(
+                User.team_id == team_id,
+                User.is_active == True,
+                User.role.in_([UserRole.MAINTENANCE, UserRole.ENGINEER])
+            )
+        )
+    )
+    users = list(result.scalars().all())
+    if not users:
+        return None
+    user_loads = []
+    for u in users:
+        wo_count = db.execute(
+            select(func.count(WorkOrder.id)).where(
+                and_(
+                    WorkOrder.assignee_id == u.id,
+                    WorkOrder.status.in_([
+                        WorkOrderStatus.ASSIGNED,
+                        WorkOrderStatus.ACCEPTED,
+                        WorkOrderStatus.IN_PROGRESS
+                    ])
+                )
+            )
+        ).scalar_one()
+        user_loads.append((wo_count, u))
+    user_loads.sort(key=lambda x: x[0])
+    return user_loads[0][1]
+
+
 @shared_task(name="app.tasks.notification_tasks.check_overdue_work_orders")
 def check_overdue_work_orders():
     db = SyncSessionLocal()
     try:
-        from app.services.work_order_service import check_and_escalate_overdue_orders
+        now = datetime.utcnow()
+        threshold = now - timedelta(minutes=settings.WORK_ORDER_AUTO_UPGRADE_MINUTES)
+        escalate_threshold = now - timedelta(minutes=settings.WORK_ORDER_AUTO_UPGRADE_MINUTES)
 
-        threshold = datetime.utcnow() - timedelta(minutes=settings.WORK_ORDER_AUTO_UPGRADE_MINUTES)
-        from sqlalchemy import and_, or_, select
-        orders = db.execute(
+        result = db.execute(
             select(WorkOrder).where(
                 and_(
                     WorkOrder.status.in_([
@@ -33,34 +121,87 @@ def check_overdue_work_orders():
                     WorkOrder.created_at < threshold,
                     or_(
                         WorkOrder.escalation_count == 0,
-                        WorkOrder.escalated_at < (datetime.utcnow() - timedelta(minutes=settings.WORK_ORDER_AUTO_UPGRADE_MINUTES))
+                        WorkOrder.escalated_at == None,
+                        WorkOrder.escalated_at < escalate_threshold
                     )
                 )
             )
-        ).scalars().all()
+        )
+        orders = list(result.scalars().all())
 
         count = 0
         for wo in orders:
             try:
-                work_order_service.escalate_work_order.__wrapped__(db, wo, reason="定时任务：超时未处理自动升级")
-                area = db.execute(select(Area).where(Area.id == wo.area_id)).scalar_one_or_none()
+                wo.status = WorkOrderStatus.ESCALATED
+                wo.escalated_at = now
+                wo.escalation_count = (wo.escalation_count or 0) + 1
+                wo.level = _escalate_level(wo.level or WarningLevel.LEVEL_1)
+
+                old_team_id = wo.team_id
+                if old_team_id:
+                    old_team = db.execute(
+                        select(MaintenanceTeam).where(MaintenanceTeam.id == old_team_id)
+                    ).scalar_one_or_none()
+                    if old_team and old_team.current_load > 0:
+                        old_team.current_load -= 1
+
+                wo.team_id = None
+                wo.assignee_id = None
+
+                if wo.area_id:
+                    new_team = _find_team_for_area(db, wo.area_id)
+                    if new_team:
+                        wo.team_id = new_team.id
+                        new_team.current_load += 1
+
+                        new_user = _find_available_user_in_team(db, new_team.id)
+                        if new_user:
+                            wo.assignee_id = new_user.id
+                            wo.status = WorkOrderStatus.ASSIGNED
+                            wo.assigned_at = now
+
+                            assignment = WorkOrderAssignment(
+                                work_order_id=wo.id,
+                                assignee_id=new_user.id,
+                                assigned_by=None,
+                                assigned_at=now,
+                                status="pending",
+                                is_active=True
+                            )
+                            db.add(assignment)
+
+                area = db.execute(
+                    select(Area).where(Area.id == wo.area_id)
+                ).scalar_one_or_none()
                 if area and area.manager_id:
-                    notification_service.create_notification.__wrapped__(
+                    _create_notification_sync(
                         db, area.manager_id, NotificationType.WARNING,
                         f"工单自动升级: {wo.title}",
-                        f"工单编号: {wo.order_no}，已升级处理",
+                        f"工单编号: {wo.order_no}，已升级至 {wo.level.value} 处理",
                         wo.id, "work_order_escalation"
                     )
+
+                dispatchers = _get_dispatchers(db, 5)
+                for did in dispatchers:
+                    _create_notification_sync(
+                        db, did, NotificationType.WARNING,
+                        f"工单自动升级: {wo.title}",
+                        f"工单编号: {wo.order_no}，已升级至 {wo.level.value}",
+                        wo.id, "work_order_escalation"
+                    )
+
                 if wo.assignee_id:
-                    notification_service.create_notification.__wrapped__(
+                    _create_notification_sync(
                         db, wo.assignee_id, NotificationType.WORK_ORDER,
                         f"升级工单已分配: {wo.title}",
-                        f"工单编号: {wo.order_no}",
+                        f"工单编号: {wo.order_no}，等级: {wo.level.value}",
                         wo.id, "work_order"
                     )
+
                 count += 1
             except Exception as e:
-                logger.error(f"升级工单失败: {wo.id}, error={e}")
+                logger.error(f"升级工单失败: wo_id={wo.id}, error={e}")
+                db.rollback()
                 continue
 
         db.commit()
@@ -78,36 +219,43 @@ def check_overdue_work_orders():
 def check_approval_reminders():
     db = SyncSessionLocal()
     try:
-        threshold = datetime.utcnow() - timedelta(hours=settings.APPROVAL_TIMEOUT_HOURS)
-        from sqlalchemy import and_, select
+        now = datetime.utcnow()
+        threshold = now - timedelta(hours=settings.APPROVAL_TIMEOUT_HOURS)
 
-        records = db.execute(
+        result = db.execute(
             select(ApprovalRecord).where(
                 and_(
                     ApprovalRecord.status == ApprovalStatus.PENDING,
                     ApprovalRecord.submitted_at < threshold
                 )
             )
-        ).scalars().all()
+        )
+        records = list(result.scalars().all())
 
         reminded = 0
         for rec in records:
             try:
-                last_remind = rec.last_reminded_at or rec.submitted_at
-                if last_remind and (datetime.utcnow() - last_remind).total_seconds() >= 3600:
-                    rec.reminder_count += 1
-                    rec.last_reminded_at = datetime.utcnow()
+                last_remind = rec.last_reminded_at
+                should_remind = False
+                if last_remind is None:
+                    should_remind = True
+                elif (now - last_remind).total_seconds() >= 3600:
+                    should_remind = True
+
+                if should_remind:
+                    rec.reminder_count = (rec.reminder_count or 0) + 1
+                    rec.last_reminded_at = now
 
                     if rec.approver_id and rec.approver_id > 0:
-                        notification_service.create_notification.__wrapped__(
+                        _create_notification_sync(
                             db, rec.approver_id, NotificationType.APPROVAL,
                             f"审批催办：阶段 {rec.stage.value}",
-                            f"项目ID: {rec.project_id}，已超时{rec.reminder_count}次提醒",
+                            f"项目ID: {rec.project_id}，已超时第{rec.reminder_count}次提醒，请尽快处理",
                             rec.project_id, "approval_reminder"
                         )
                     reminded += 1
             except Exception as e:
-                logger.error(f"催办失败: {rec.id}, error={e}")
+                logger.error(f"催办失败: approval_id={rec.id}, error={e}")
                 continue
 
         db.commit()
@@ -125,54 +273,90 @@ def check_approval_reminders():
 def auto_adjust_pressure_stations():
     db = SyncSessionLocal()
     try:
-        from sqlalchemy import select, and_, desc, func
-        stations = db.execute(select(PressureStation).where(PressureStation.status == "normal")).scalars().all()
+        now = datetime.utcnow()
+        current_hour = now.hour
+
+        stations_result = db.execute(
+            select(PressureStation).where(PressureStation.status == "normal")
+        )
+        stations = list(stations_result.scalars().all())
 
         adjusted = 0
         for station in stations:
             try:
-                sensors = db.execute(
+                sensors_result = db.execute(
                     select(Sensor).where(
                         and_(
                             Sensor.pressure_station_id == station.id,
-                            Sensor.type == "pressure"
+                            Sensor.type == SensorType.PRESSURE
                         )
                     )
-                ).scalars().all()
+                )
+                sensors = list(sensors_result.scalars().all())
                 if not sensors:
                     continue
 
                 total_pressure = Decimal("0")
-                count = 0
+                count_readings = 0
                 for s in sensors:
                     latest = db.execute(
                         select(SensorReading).where(
                             SensorReading.sensor_id == s.id
-                        ).order_by(SensorReading.reading_time.desc()).limit(1)
+                        ).order_by(desc(SensorReading.reading_time)).limit(1)
                     ).scalar_one_or_none()
                     if latest:
                         total_pressure += latest.value
-                        count += 1
+                        count_readings += 1
 
-                if count == 0:
+                if count_readings == 0:
                     continue
 
-                avg_pressure = total_pressure / Decimal(count)
-                log = sensor_service.check_auto_adjust_pressure.__wrapped__(
-                    db, station, avg_pressure, datetime.utcnow()
-                )
-                if log:
+                avg_pressure = total_pressure / Decimal(count_readings)
+
+                is_peak = current_hour in settings.PEAK_HOURS
+                if is_peak:
+                    target = station.outlet_pressure_max * Decimal("0.95") if station.outlet_pressure_max else avg_pressure
+                    reason = "高峰时段自动调节"
+                else:
+                    p_min = station.outlet_pressure_min if station.outlet_pressure_min else avg_pressure
+                    p_set = station.outlet_pressure_set if station.outlet_pressure_set else avg_pressure
+                    target = p_min + (p_set - p_min) * Decimal("0.5")
+                    reason = "常规时段自动调节"
+
+                deviation = abs(avg_pressure - target)
+                threshold_dev = target * Decimal("0.05")
+
+                if deviation > threshold_dev:
+                    trigger_condition = {
+                        "peak_hours": is_peak,
+                        "current_hour": current_hour,
+                        "avg_pressure": float(avg_pressure),
+                        "target_pressure": float(target),
+                        "deviation": float(deviation),
+                        "threshold": float(threshold_dev)
+                    }
+
+                    log = ControlLog(
+                        pressure_station_id=station.id,
+                        dispatcher_id=None,
+                        old_outlet_pressure=avg_pressure,
+                        new_outlet_pressure=target,
+                        reason=reason,
+                        is_auto=True,
+                        trigger_condition=trigger_condition,
+                        created_at=now
+                    )
+                    db.add(log)
+                    db.flush()
+
                     adjusted += 1
-                    dispatcher_ids = db.execute(
-                        select(User.id).where(
-                            and_(User.role == UserRole.DISPATCHER, User.is_active == True)
-                        )
-                    ).scalars().all()
-                    for uid in dispatcher_ids[:5]:
-                        notification_service.create_notification.__wrapped__(
-                            db, uid, NotificationType.SYSTEM,
+
+                    dispatchers = _get_dispatchers(db, 3)
+                    for did in dispatchers:
+                        _create_notification_sync(
+                            db, did, NotificationType.SYSTEM,
                             f"调压站自动调节: {station.name}",
-                            f"{log.old_outlet_pressure} -> {log.new_outlet_pressure} kPa，原因: {log.reason}",
+                            f"{avg_pressure} -> {target} kPa，原因: {reason}",
                             station.id, "pressure_adjust"
                         )
             except Exception as e:

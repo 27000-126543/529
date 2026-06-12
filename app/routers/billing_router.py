@@ -11,7 +11,7 @@ from app.models import (
     GasPriceTier, Bill, BillStatus, GasStatus, Payment, MeterReading,
     EngineeringProject, ApprovalStage, ApprovalStatus, ApprovalRecord,
     GasSupplier, GasInventory, GasPurchasePlan, PurchaseStatus,
-    DailyReport, NotificationType
+    DailyReport, NotificationType, Area
 )
 from app.schemas.billing import (
     ResidentAccountCreate, ResidentAccountUpdate, ResidentAccountInfo, ResidentAccountListResponse,
@@ -584,16 +584,51 @@ async def list_purchase_plans(
 
 
 @purchase_router.post("/plans/{plan_id}/approve", response_model=SuccessResponse, dependencies=[Depends(require_roles(UserRole.ADMIN))])
-async def approve_purchase_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
+async def approve_purchase_plan(
+    plan_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     result = await db.execute(select(GasPurchasePlan).where(GasPurchasePlan.id == plan_id))
     plan = result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="采购计划不存在")
-    plan.status = PurchaseStatus.APPROVED
-    plan.approver_id = (await get_current_user(db=db)).id  # type: ignore
+
+    plan.approver_id = current_user.id
     plan.approved_at = datetime.utcnow()
-    plan.ordered_at = datetime.utcnow()
+    plan.status = PurchaseStatus.APPROVED
+
     plan.status = PurchaseStatus.ORDERED
+    plan.ordered_at = datetime.utcnow()
+
+    dispatchers_result = await db.execute(
+        select(User).where(and_(User.role == UserRole.DISPATCHER, User.is_active == True)).limit(5)
+    )
+    dispatchers = dispatchers_result.scalars().all()
+
+    approval_title = f"采购计划已审批通过"
+    approval_content = f"计划编号: {plan.plan_no}，采购量: {plan.planned_volume}，金额: {plan.total_amount or '待确认'}"
+    for d in dispatchers:
+        await notification_service.create_notification(
+            db, d.id, NotificationType.APPROVAL,
+            approval_title, approval_content,
+            plan.id, "gas_purchase_plan"
+        )
+
+    if plan.supplier_id:
+        supplier_result = await db.execute(select(GasSupplier).where(GasSupplier.id == plan.supplier_id))
+        supplier = supplier_result.scalar_one_or_none()
+        if supplier:
+            supplier_info = f"{supplier.code} - {supplier.name}"
+            system_title = "采购计划已通知供应商"
+            system_content = f"计划编号: {plan.plan_no}，供应商: {supplier_info}，采购量: {plan.planned_volume}"
+            for d in dispatchers:
+                await notification_service.create_notification(
+                    db, d.id, NotificationType.SYSTEM,
+                    system_title, system_content,
+                    plan.id, "gas_purchase_plan"
+                )
+
     await db.commit()
     return SuccessResponse(message="采购计划已审批通过并下单")
 
@@ -609,6 +644,7 @@ async def update_purchase_status(
     plan = result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="采购计划不存在")
+
     plan.status = status
     if status == PurchaseStatus.SHIPPED:
         plan.shipped_at = datetime.utcnow()
@@ -616,8 +652,37 @@ async def update_purchase_status(
         plan.delivered_at = datetime.utcnow()
         if delivered_volume:
             plan.delivered_volume = delivered_volume
+            inv_result = await db.execute(select(GasInventory).limit(1))
+            inv = inv_result.scalar_one_or_none()
+            if inv:
+                inv.current_volume += delivered_volume
+                inv.last_updated = datetime.utcnow()
     elif status == PurchaseStatus.COMPLETED:
         plan.completed_at = datetime.utcnow()
+        plan.status = PurchaseStatus.COMPLETED
+
+    dispatchers_result = await db.execute(
+        select(User).where(and_(User.role == UserRole.DISPATCHER, User.is_active == True)).limit(5)
+    )
+    dispatchers = dispatchers_result.scalars().all()
+
+    notify_title = f"采购计划状态更新"
+    notify_content = f"计划编号: {plan.plan_no}，当前状态: {status.value}"
+
+    if plan.approver_id:
+        await notification_service.create_notification(
+            db, plan.approver_id, NotificationType.APPROVAL,
+            notify_title, notify_content,
+            plan.id, "gas_purchase_plan"
+        )
+
+    for d in dispatchers:
+        await notification_service.create_notification(
+            db, d.id, NotificationType.APPROVAL,
+            notify_title, notify_content,
+            plan.id, "gas_purchase_plan"
+        )
+
     await db.commit()
     return SuccessResponse(message="状态已更新")
 
@@ -682,20 +747,34 @@ async def export_excel(
     query = query.order_by(DailyReport.report_date.desc())
     items = (await db.execute(query)).scalars().all()
 
+    area_ids = list(set(r.area_id for r in items if r.area_id is not None))
+    area_name_map: dict = {}
+    if area_ids:
+        area_result = await db.execute(select(Area).where(Area.id.in_(area_ids)))
+        areas = area_result.scalars().all()
+        area_name_map = {a.id: a.name for a in areas}
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "运行报表"
     headers = [
-        "报表日期", "区域ID", "总输气量", "高峰小时输气量",
-        "泄漏事件数", "已解决泄漏数", "泄漏发现率(%)",
-        "工单总数", "已完成工单数", "平均响应时长(分钟)", "平均解决时长(分钟)",
-        "投诉数", "投诉率(%)", "新增开户数", "欠费账单数", "营收"
+        "报表日期", "区域", "总输气量(m³)", "高峰小时输气量(m³)",
+        "泄漏事件(起)", "已解决泄漏(起)", "泄漏发现率(%)",
+        "工单总数", "已完成工单", "平均响应(分)", "平均解决(分)",
+        "投诉数(起)", "投诉率(‰)", "新增开户(户)", "欠费账单数", "营收(元)"
     ]
     ws.append(headers)
+
+    from openpyxl.styles import Font
+    header_font = Font(bold=True)
+    for col_idx in range(1, len(headers) + 1):
+        ws.cell(row=1, column=col_idx).font = header_font
+
     for r in items:
+        area_name = area_name_map.get(r.area_id, "全局") if r.area_id else "全局"
         ws.append([
             str(r.report_date),
-            r.area_id or "",
+            area_name,
             float(r.total_gas_volume),
             float(r.peak_hour_volume),
             r.leak_count,
@@ -713,7 +792,8 @@ async def export_excel(
         ])
 
     for col in range(1, len(headers) + 1):
-        ws.column_dimensions[chr(64 + col)].width = 18
+        col_letter = chr(64 + col) if col <= 26 else chr(64 + (col - 1) // 26) + chr(65 + (col - 1) % 26)
+        ws.column_dimensions[col_letter].width = 16
 
     buf = BytesIO()
     wb.save(buf)
