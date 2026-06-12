@@ -288,6 +288,8 @@ class WorkOrder(Base):
     resolution_minutes = Column(Integer)
     escalated_at = Column(TIMESTAMP(timezone=True))
     escalation_count = Column(Integer, default=0)
+    is_cross_area = Column(Boolean, default=False)
+    cross_area_from_area_id = Column(BigInteger, nullable=True)
     result = Column(Text)
     images = Column(JSON)
     created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow, index=True)
@@ -539,7 +541,7 @@ class GasPurchasePlan(Base):
 class DailyReport(Base):
     __tablename__ = "daily_reports"
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    report_date = Column(Date, unique=True, nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)
     area_id = Column(BigInteger, ForeignKey("areas.id"), index=True)
     total_gas_volume = Column(Numeric(15, 4), default=0)
     peak_hour_volume = Column(Numeric(15, 4), default=0)

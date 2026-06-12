@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
 from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,27 +18,29 @@ async def find_nearest_team(
     longitude: Optional[Decimal],
     latitude: Optional[Decimal],
     exclude_team_ids: Optional[List[int]] = None
-) -> Optional[MaintenanceTeam]:
-    query = select(MaintenanceTeam).where(
+) -> Tuple[Optional[MaintenanceTeam], bool]:
+    base_query = select(MaintenanceTeam).where(
         and_(
             MaintenanceTeam.status == "active",
             MaintenanceTeam.current_load < MaintenanceTeam.max_capacity
         )
     )
     if exclude_team_ids:
-        query = query.where(MaintenanceTeam.id.notin_(exclude_team_ids))
+        base_query = base_query.where(MaintenanceTeam.id.notin_(exclude_team_ids))
 
+    is_cross_area = False
+    query = base_query
     if area_id:
-        area_result = await db.execute(
-            select(
-                MaintenanceTeam.area_id.in_([area_id])
-            )
-        )
-        pass
+        query = base_query.where(MaintenanceTeam.area_id == area_id)
 
     teams = (await db.execute(query)).scalars().all()
+
+    if not teams and area_id:
+        teams = (await db.execute(base_query)).scalars().all()
+        is_cross_area = True
+
     if not teams:
-        return None
+        return None, is_cross_area
 
     scored = []
     for team in teams:
@@ -52,7 +54,9 @@ async def find_nearest_team(
         scored.append((score, team))
 
     scored.sort(key=lambda x: x[0])
-    return scored[0][1] if scored else None
+    if scored:
+        return scored[0][1], is_cross_area
+    return None, is_cross_area
 
 
 async def find_available_user_in_team(
@@ -119,7 +123,7 @@ async def create_work_order(
     await db.flush()
 
     if auto_assign:
-        await assign_work_order(db, wo)
+        await assign_work_order(db, wo, prefer_area_id=wo.area_id)
 
     return wo
 
@@ -128,15 +132,17 @@ async def assign_work_order(
     db: AsyncSession,
     work_order: WorkOrder,
     team_id: Optional[int] = None,
-    assignee_id: Optional[int] = None
+    assignee_id: Optional[int] = None,
+    prefer_area_id: Optional[int] = None
 ) -> WorkOrder:
     if not team_id and not work_order.team_id:
         team_id = work_order.team_id
 
     if not team_id:
-        team = await find_nearest_team(
+        search_area_id = prefer_area_id if prefer_area_id is not None else work_order.area_id
+        team, is_cross_area = await find_nearest_team(
             db,
-            work_order.area_id,
+            search_area_id,
             work_order.longitude,
             work_order.latitude
         )
@@ -144,6 +150,28 @@ async def assign_work_order(
             team_id = team.id
             work_order.team_id = team_id
             team.current_load += 1
+
+            if is_cross_area and prefer_area_id is not None:
+                work_order.is_cross_area = True
+                work_order.cross_area_from_area_id = prefer_area_id
+
+                from_area_result = await db.execute(
+                    select(Area).where(Area.id == prefer_area_id)
+                )
+                from_area = from_area_result.scalar_one_or_none()
+                from_area_name = from_area.name if from_area else f"ID{prefer_area_id}"
+
+                to_area_result = await db.execute(
+                    select(Area).where(Area.id == team.area_id)
+                )
+                to_area = to_area_result.scalar_one_or_none()
+                to_area_name = to_area.name if to_area else f"ID{team.area_id}"
+
+                cross_note = f"\n\n跨区支援：原区域{from_area_name}，派单至区域{to_area_name}"
+                if work_order.description:
+                    work_order.description = work_order.description + cross_note
+                else:
+                    work_order.description = cross_note.strip()
 
     if not assignee_id and team_id:
         user = await find_available_user_in_team(db, team_id)
@@ -243,7 +271,8 @@ async def escalate_work_order(db: AsyncSession, work_order: WorkOrder, reason: O
 
     work_order.team_id = None
     work_order.assignee_id = None
-    await assign_work_order(db, work_order)
+    escalate_prefer_area_id = work_order.cross_area_from_area_id if work_order.is_cross_area else work_order.area_id
+    await assign_work_order(db, work_order, prefer_area_id=escalate_prefer_area_id)
 
     return work_order
 

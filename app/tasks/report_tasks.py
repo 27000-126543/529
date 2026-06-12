@@ -151,13 +151,13 @@ def _get_revenue(db, report_date, area_id=None):
 
 
 def _upsert_daily_report(db, report_date, area_id, stats):
+    conditions = [DailyReport.report_date == report_date]
+    if area_id is None:
+        conditions.append(DailyReport.area_id.is_(None))
+    else:
+        conditions.append(DailyReport.area_id == area_id)
     existing = db.execute(
-        select(DailyReport).where(
-            and_(
-                DailyReport.report_date == report_date,
-                DailyReport.area_id.is_(None) if area_id is None else DailyReport.area_id == area_id
-            )
-        )
+        select(DailyReport).where(and_(*conditions))
     ).scalar_one_or_none()
     if existing:
         existing.total_gas_volume = stats["total_gas_volume"]
@@ -174,7 +174,7 @@ def _upsert_daily_report(db, report_date, area_id, stats):
         existing.complaint_count = 0
         existing.complaint_rate = Decimal("0")
         existing.new_connection_count = 0
-        return existing
+        report = existing
     else:
         report = DailyReport(
             report_date=report_date,
@@ -196,7 +196,18 @@ def _upsert_daily_report(db, report_date, area_id, stats):
         )
         db.add(report)
         db.flush()
-        return report
+
+    verify_conditions = [DailyReport.report_date == report_date]
+    if area_id is None:
+        verify_conditions.append(DailyReport.area_id.is_(None))
+    else:
+        verify_conditions.append(DailyReport.area_id == area_id)
+    verified = db.execute(select(DailyReport).where(and_(*verify_conditions))).scalar_one_or_none()
+    if not verified or verified.id != report.id:
+        logger.error(f"日报生成后校验失败: report_date={report_date}, area_id={area_id}, report_id={report.id}")
+        raise RuntimeError(f"日报生成校验失败，(report_date={report_date}, area_id={area_id}) 组合不存在或不匹配")
+
+    return report
 
 
 @shared_task(name="app.tasks.report_tasks.generate_daily_reports")
@@ -208,7 +219,8 @@ def generate_daily_reports():
         areas = list(db.execute(select(Area)).scalars().all())
         area_ids = [None] + [a.id for a in areas]
 
-        generated = 0
+        actual_count = 0
+        failed_count = 0
         for area_id in area_ids:
             try:
                 total_gas = _get_total_gas_volume(db, report_date, area_id)
@@ -232,26 +244,26 @@ def generate_daily_reports():
                     "revenue": revenue
                 }
                 _upsert_daily_report(db, report_date, area_id, stats)
-                generated += 1
+                db.commit()
+                actual_count += 1
             except Exception as e:
                 logger.error(f"生成日报失败: area_id={area_id}, error={e}")
                 db.rollback()
+                failed_count += 1
                 continue
-
-        db.commit()
 
         dispatchers = _get_dispatchers(db, 3)
         for did in dispatchers:
             _create_notification_sync(
                 db, did, NotificationType.SYSTEM,
                 f"每日运行报表已生成",
-                f"报表日期: {report_date}，共生成 {generated} 份区域报表，包括全局和 {len(areas)} 个区域",
+                f"报表日期: {report_date}，生成了 {actual_count} 份日报（成功{actual_count}条，失败{failed_count}条），包括全局和 {len(areas)} 个区域",
                 None, "daily_report"
             )
         db.commit()
 
-        logger.info(f"generate_daily_reports: 生成了 {generated} 份日报")
-        return {"date": str(report_date), "generated": generated}
+        logger.info(f"generate_daily_reports: 生成了 {actual_count} 份日报（成功{actual_count}条，失败{failed_count}条）")
+        return {"date": str(report_date), "generated": actual_count, "failed": failed_count}
     except Exception as e:
         logger.error(f"generate_daily_reports error: {e}")
         db.rollback()
@@ -296,7 +308,8 @@ def predict_daily_demand():
         areas = list(db.execute(select(Area)).scalars().all())
         area_ids = [None] + [a.id for a in areas]
 
-        total_written = 0
+        actual_count = 0
+        failed_count = 0
         for area_id in area_ids:
             try:
                 hourly_sum = _build_hourly_sum(db, start_date, end_date, area_id)
@@ -304,35 +317,41 @@ def predict_daily_demand():
                 avg_daily = total_sum / Decimal(days_covered) if days_covered > 0 else Decimal("0")
 
                 for hour in range(24):
-                    hour_avg = hourly_sum[hour] / Decimal(days_covered) if days_covered > 0 else Decimal("0")
-                    prediction = LoadPrediction(
-                        prediction_date=for_date,
-                        prediction_hour=hour,
-                        area_id=area_id,
-                        predicted_volume=hour_avg,
-                        model_version="v1.0"
-                    )
-                    db.add(prediction)
-                    total_written += 1
+                    try:
+                        hour_avg = hourly_sum[hour] / Decimal(days_covered) if days_covered > 0 else Decimal("0")
+                        prediction = LoadPrediction(
+                            prediction_date=for_date,
+                            prediction_hour=hour,
+                            area_id=area_id,
+                            predicted_volume=hour_avg,
+                            model_version="v1.0"
+                        )
+                        db.add(prediction)
+                        db.commit()
+                        actual_count += 1
+                    except Exception as e:
+                        logger.error(f"预测失败: area_id={area_id}, hour={hour}, error={e}")
+                        db.rollback()
+                        failed_count += 1
+                        continue
             except Exception as e:
-                logger.error(f"预测失败: area_id={area_id}, error={e}")
+                logger.error(f"区域预测失败: area_id={area_id}, error={e}")
                 db.rollback()
+                failed_count += 24
                 continue
-
-        db.commit()
 
         dispatchers = _get_dispatchers(db, 3)
         for did in dispatchers:
             _create_notification_sync(
                 db, did, NotificationType.SYSTEM,
                 f"每日负荷预测完成",
-                f"预测日期: {for_date}，共生成 {total_written} 条预测记录",
+                f"预测日期: {for_date}，共生成 {actual_count} 条预测记录（成功{actual_count}条，失败{failed_count}条）",
                 None, "load_prediction"
             )
         db.commit()
 
-        logger.info(f"predict_daily_demand: 完成 {len(area_ids)} 个区域预测，共 {total_written} 条记录")
-        return {"date": str(for_date), "predictions": total_written}
+        logger.info(f"predict_daily_demand: 完成 {len(area_ids)} 个区域预测，共 {actual_count} 条记录（成功{actual_count}条，失败{failed_count}条）")
+        return {"date": str(for_date), "predictions": actual_count, "failed": failed_count}
     except Exception as e:
         logger.error(f"predict_daily_demand error: {e}")
         db.rollback()
@@ -359,49 +378,70 @@ def generate_monthly_purchase_plan():
             logger.info(f"generate_monthly_purchase_plan: {plan_month} 已存在，跳过")
             return {"status": "exists", "plan_month": plan_month}
 
-        predicted_demand = Decimal(str(random.uniform(500000.0, 1000000.0)))
+        actual_count = 0
+        failed_count = 0
+        plan = None
 
-        inv_result = db.execute(
-            select(func.coalesce(func.sum(GasInventory.current_volume), Decimal("0")))
-        ).scalar_one()
-        current_inventory = inv_result or Decimal("0")
+        try:
+            predicted_demand = Decimal(str(random.uniform(500000.0, 1000000.0)))
 
-        safety_stock = predicted_demand * Decimal("0.15")
-        planned_volume = max(Decimal("0"), predicted_demand + safety_stock - current_inventory)
+            inv_result = db.execute(
+                select(func.coalesce(func.sum(GasInventory.current_volume), Decimal("0")))
+            ).scalar_one()
+            current_inventory = inv_result or Decimal("0")
 
-        supplier = db.execute(
-            select(GasSupplier).where(GasSupplier.is_active == True)
-        ).scalars().first()
-        supplier_id = supplier.id if supplier else None
-        unit_price = Decimal("3.5")
-        total_amount = planned_volume * unit_price
+            safety_stock = predicted_demand * Decimal("0.15")
+            planned_volume = max(Decimal("0"), predicted_demand + safety_stock - current_inventory)
 
-        plan = GasPurchasePlan(
-            plan_no=generate_order_no("PP"),
-            plan_month=plan_month,
-            predicted_demand=predicted_demand,
-            current_inventory=current_inventory,
-            safety_stock=safety_stock,
-            planned_volume=planned_volume,
-            supplier_id=supplier_id,
-            unit_price=unit_price,
-            total_amount=total_amount
-        )
-        db.add(plan)
-        db.flush()
+            supplier = db.execute(
+                select(GasSupplier).where(GasSupplier.is_active == True)
+            ).scalars().first()
+            supplier_id = supplier.id if supplier else None
+            unit_price = Decimal("3.5")
+            total_amount = planned_volume * unit_price
+
+            plan = GasPurchasePlan(
+                plan_no=generate_order_no("PP"),
+                plan_month=plan_month,
+                predicted_demand=predicted_demand,
+                current_inventory=current_inventory,
+                safety_stock=safety_stock,
+                planned_volume=planned_volume,
+                supplier_id=supplier_id,
+                unit_price=unit_price,
+                total_amount=total_amount
+            )
+            db.add(plan)
+            db.flush()
+            db.commit()
+            actual_count = 1
+        except Exception as e:
+            logger.error(f"生成采购计划失败: plan_month={plan_month}, error={e}")
+            db.rollback()
+            failed_count = 1
+            return {"status": "failed", "plan_month": plan_month, "failed": failed_count}
 
         dispatchers = _get_dispatchers(db, 3)
+        notification_success = 0
+        notification_failed = 0
         for did in dispatchers:
-            _create_notification_sync(
-                db, did, NotificationType.SYSTEM,
-                f"月度采购计划已生成",
-                f"月份: {plan_month}，计划采购: {planned_volume} m³，金额: {total_amount}元",
-                plan.id, "purchase_plan"
-            )
-        db.commit()
+            try:
+                _create_notification_sync(
+                    db, did, NotificationType.SYSTEM,
+                    f"月度采购计划已生成",
+                    f"月份: {plan_month}，计划采购: {planned_volume} m³，金额: {total_amount}元（成功{actual_count}条，失败{failed_count}条）",
+                    plan.id, "purchase_plan"
+                )
+                db.commit()
+                notification_success += 1
+            except Exception as e:
+                logger.error(f"发送采购计划通知失败: dispatcher_id={did}, error={e}")
+                db.rollback()
+                notification_failed += 1
+                continue
 
-        logger.info(f"generate_monthly_purchase_plan: 已生成采购计划 {plan.plan_no}")
-        return {"plan_month": plan_month, "plan_id": plan.id, "planned_volume": float(planned_volume)}
+        logger.info(f"generate_monthly_purchase_plan: 已生成采购计划 {plan.plan_no}（成功{actual_count}条，失败{failed_count}条），通知成功{notification_success}条，失败{notification_failed}条")
+        return {"plan_month": plan_month, "plan_id": plan.id, "planned_volume": float(planned_volume), "generated": actual_count, "failed": failed_count}
     except Exception as e:
         logger.error(f"generate_monthly_purchase_plan error: {e}")
         db.rollback()

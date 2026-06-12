@@ -68,3 +68,9 @@ class FinalApprovalResponse(BaseSchema):
     construction_team_id: Optional[int] = None
     actual_start_date: Optional[date] = None
     status: str
+
+
+class DailyReportCreateResponse(BaseSchema):
+    id: int
+    report_date: date
+    area_id: Optional[int] = None

@@ -125,7 +125,8 @@ def check_overdue_work_orders():
         )
         orders = list(result.scalars().all())
 
-        count = 0
+        actual_count = 0
+        failed_count = 0
         for wo in orders:
             try:
                 wo.status = "escalated"
@@ -170,50 +171,64 @@ def check_overdue_work_orders():
                     select(Area).where(Area.id == wo.area_id)
                 ).scalar_one_or_none()
                 if area and area.manager_id:
-                    _create_notification_sync(
-                        db, area.manager_id, NotificationType.WARNING,
-                        f"工单自动升级: {wo.title}",
-                        f"工单编号: {wo.order_no}，已升级至 {wo.level.value} 处理",
-                        wo.id, "work_order_escalation"
-                    )
+                    try:
+                        _create_notification_sync(
+                            db, area.manager_id, NotificationType.WARNING,
+                            f"工单自动升级: {wo.title}",
+                            f"工单编号: {wo.order_no}，已升级至 {wo.level.value} 处理",
+                            wo.id, "work_order_escalation"
+                        )
+                    except Exception as e:
+                        logger.error(f"发送区域经理通知失败: wo_id={wo.id}, manager_id={area.manager_id}, error={e}")
 
                 dispatchers = _get_dispatchers(db, 3)
                 for did in dispatchers:
-                    _create_notification_sync(
-                        db, did, NotificationType.WARNING,
-                        f"工单自动升级: {wo.title}",
-                        f"工单编号: {wo.order_no}，已升级至 {wo.level.value}",
-                        wo.id, "work_order_escalation"
-                    )
+                    try:
+                        _create_notification_sync(
+                            db, did, NotificationType.WARNING,
+                            f"工单自动升级: {wo.title}",
+                            f"工单编号: {wo.order_no}，已升级至 {wo.level.value}",
+                            wo.id, "work_order_escalation"
+                        )
+                    except Exception as e:
+                        logger.error(f"发送调度员通知失败: wo_id={wo.id}, dispatcher_id={did}, error={e}")
 
                 if wo.assignee_id:
-                    _create_notification_sync(
-                        db, wo.assignee_id, NotificationType.WORK_ORDER,
-                        f"升级工单已分配: {wo.title}",
-                        f"工单编号: {wo.order_no}，等级: {wo.level.value}",
-                        wo.id, "work_order"
-                    )
+                    try:
+                        _create_notification_sync(
+                            db, wo.assignee_id, NotificationType.WORK_ORDER,
+                            f"升级工单已分配: {wo.title}",
+                            f"工单编号: {wo.order_no}，等级: {wo.level.value}",
+                            wo.id, "work_order"
+                        )
+                    except Exception as e:
+                        logger.error(f"发送处理人通知失败: wo_id={wo.id}, assignee_id={wo.assignee_id}, error={e}")
 
-                count += 1
+                db.commit()
+                actual_count += 1
             except Exception as e:
                 logger.error(f"升级工单失败: wo_id={wo.id}, error={e}")
                 db.rollback()
+                failed_count += 1
                 continue
-
-        db.commit()
 
         dispatchers = _get_dispatchers(db, 3)
         for did in dispatchers:
-            _create_notification_sync(
-                db, did, NotificationType.SYSTEM,
-                f"超时工单自动升级完成",
-                f"共升级 {count} 个超时工单",
-                None, "work_order_escalation"
-            )
-        db.commit()
+            try:
+                _create_notification_sync(
+                    db, did, NotificationType.SYSTEM,
+                    f"超时工单自动升级完成",
+                    f"共升级 {actual_count} 个超时工单（成功{actual_count}条，失败{failed_count}条）",
+                    None, "work_order_escalation"
+                )
+                db.commit()
+            except Exception as e:
+                logger.error(f"发送完成通知失败: dispatcher_id={did}, error={e}")
+                db.rollback()
+                continue
 
-        logger.info(f"check_overdue_work_orders: 升级了 {count} 个工单")
-        return {"escalated": count}
+        logger.info(f"check_overdue_work_orders: 升级了 {actual_count} 个工单（成功{actual_count}条，失败{failed_count}条）")
+        return {"escalated": actual_count, "failed": failed_count}
     except Exception as e:
         logger.error(f"check_overdue_work_orders error: {e}")
         db.rollback()
@@ -239,7 +254,8 @@ def check_approval_reminders():
         )
         records = list(result.scalars().all())
 
-        reminded = 0
+        actual_count = 0
+        failed_count = 0
         for rec in records:
             try:
                 last_remind = rec.last_reminded_at
@@ -260,25 +276,31 @@ def check_approval_reminders():
                             f"项目ID: {rec.project_id}，已超时第{rec.reminder_count}次提醒，请尽快处理",
                             rec.project_id, "approval_reminder"
                         )
-                    reminded += 1
+                    db.commit()
+                    actual_count += 1
             except Exception as e:
                 logger.error(f"催办失败: approval_id={rec.id}, error={e}")
+                db.rollback()
+                failed_count += 1
                 continue
-
-        db.commit()
 
         dispatchers = _get_dispatchers(db, 3)
         for did in dispatchers:
-            _create_notification_sync(
-                db, did, NotificationType.SYSTEM,
-                f"审批催办完成",
-                f"共催办 {reminded} 条超时审批",
-                None, "approval_reminder"
-            )
-        db.commit()
+            try:
+                _create_notification_sync(
+                    db, did, NotificationType.SYSTEM,
+                    f"审批催办完成",
+                    f"共催办 {actual_count} 条超时审批（成功{actual_count}条，失败{failed_count}条）",
+                    None, "approval_reminder"
+                )
+                db.commit()
+            except Exception as e:
+                logger.error(f"发送完成通知失败: dispatcher_id={did}, error={e}")
+                db.rollback()
+                continue
 
-        logger.info(f"check_approval_reminders: 催办了 {reminded} 条审批")
-        return {"reminded": reminded}
+        logger.info(f"check_approval_reminders: 催办了 {actual_count} 条审批（成功{actual_count}条，失败{failed_count}条）")
+        return {"reminded": actual_count, "failed": failed_count}
     except Exception as e:
         logger.error(f"check_approval_reminders error: {e}")
         db.rollback()
@@ -299,7 +321,8 @@ def auto_adjust_pressure_stations():
         )
         stations = list(stations_result.scalars().all())
 
-        adjusted = 0
+        actual_count = 0
+        failed_count = 0
         for station in stations:
             try:
                 sensors_result = db.execute(
@@ -367,34 +390,43 @@ def auto_adjust_pressure_stations():
                     db.add(log)
                     db.flush()
 
-                    adjusted += 1
-
                     dispatchers = _get_dispatchers(db, 3)
                     for did in dispatchers:
-                        _create_notification_sync(
-                            db, did, NotificationType.SYSTEM,
-                            f"调压站自动调节: {station.name}",
-                            f"{avg_pressure} -> {target} kPa，原因: {reason}",
-                            station.id, "pressure_adjust"
-                        )
+                        try:
+                            _create_notification_sync(
+                                db, did, NotificationType.SYSTEM,
+                                f"调压站自动调节: {station.name}",
+                                f"{avg_pressure} -> {target} kPa，原因: {reason}",
+                                station.id, "pressure_adjust"
+                            )
+                        except Exception as e:
+                            logger.error(f"发送调压站调节通知失败: station={station.name}, dispatcher_id={did}, error={e}")
+
+                    db.commit()
+                    actual_count += 1
             except Exception as e:
                 logger.error(f"调压站 {station.name} 调节失败: {e}")
+                db.rollback()
+                failed_count += 1
                 continue
-
-        db.commit()
 
         dispatchers = _get_dispatchers(db, 3)
         for did in dispatchers:
-            _create_notification_sync(
-                db, did, NotificationType.SYSTEM,
-                f"调压站自动调节完成",
-                f"共调节 {adjusted} 个调压站",
-                None, "pressure_adjust"
-            )
-        db.commit()
+            try:
+                _create_notification_sync(
+                    db, did, NotificationType.SYSTEM,
+                    f"调压站自动调节完成",
+                    f"共调节 {actual_count} 个调压站（成功{actual_count}条，失败{failed_count}条）",
+                    None, "pressure_adjust"
+                )
+                db.commit()
+            except Exception as e:
+                logger.error(f"发送完成通知失败: dispatcher_id={did}, error={e}")
+                db.rollback()
+                continue
 
-        logger.info(f"auto_adjust_pressure_stations: 调节了 {adjusted} 个调压站")
-        return {"adjusted": adjusted}
+        logger.info(f"auto_adjust_pressure_stations: 调节了 {actual_count} 个调压站（成功{actual_count}条，失败{failed_count}条）")
+        return {"adjusted": actual_count, "failed": failed_count}
     except Exception as e:
         logger.error(f"auto_adjust_pressure_stations error: {e}")
         db.rollback()

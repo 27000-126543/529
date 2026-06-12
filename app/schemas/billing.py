@@ -303,6 +303,7 @@ class DailyReportInfo(BaseSchema):
     id: int
     report_date: date
     area_id: Optional[int] = None
+    area_name: Optional[str] = None
     total_gas_volume: Decimal = Decimal("0")
     peak_hour_volume: Decimal = Decimal("0")
     leak_count: int = 0

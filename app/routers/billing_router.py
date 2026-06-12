@@ -26,7 +26,7 @@ from app.schemas.billing import (
     GasPurchasePlanCreate, GasPurchasePlanInfo, GasPurchasePlanListResponse,
     DailyReportInfo, DailyReportListResponse
 )
-from app.schemas.common import IdResponse, SuccessResponse, ProjectCreateResponse, FinalApprovalResponse, ProjectDetailResponse
+from app.schemas.common import IdResponse, SuccessResponse, ProjectCreateResponse, FinalApprovalResponse, ProjectDetailResponse, DailyReportCreateResponse
 from app.utils.security import get_current_user, require_roles, generate_order_no
 from app.services import billing_service, project_service, sensor_service, notification_service, work_order_service
 from app.schemas.sensor import WorkOrderCreate
@@ -821,7 +821,7 @@ async def update_purchase_status(
 report_router = APIRouter(prefix="/api/v1/reports", tags=["运行报表"])
 
 
-@report_router.post("/generate-daily", response_model=IdResponse, dependencies=[Depends(require_roles(UserRole.ADMIN, UserRole.DISPATCHER))])
+@report_router.post("/generate-daily", response_model=DailyReportCreateResponse, dependencies=[Depends(require_roles(UserRole.ADMIN, UserRole.DISPATCHER))])
 async def generate_daily_report(
     report_date: date,
     area_id: Optional[int] = None,
@@ -830,7 +830,11 @@ async def generate_daily_report(
     report = await sensor_service.generate_daily_report(db, report_date, area_id)
     await db.commit()
     await db.refresh(report)
-    return IdResponse(id=report.id)
+    return DailyReportCreateResponse(
+        id=report.id,
+        report_date=report.report_date,
+        area_id=report.area_id
+    )
 
 
 @report_router.get("/daily", response_model=DailyReportListResponse)
@@ -840,6 +844,7 @@ async def list_daily_reports(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     area_id: Optional[int] = None,
+    is_global: Optional[bool] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
     query = select(DailyReport)
@@ -847,17 +852,35 @@ async def list_daily_reports(
         query = query.where(DailyReport.report_date >= start_date)
     if end_date:
         query = query.where(DailyReport.report_date <= end_date)
-    if area_id:
+    if is_global is not None:
+        if is_global:
+            query = query.where(DailyReport.area_id.is_(None))
+        else:
+            query = query.where(DailyReport.area_id.is_not(None))
+    elif area_id is not None:
         query = query.where(DailyReport.area_id == area_id)
 
     total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
     query = query.order_by(DailyReport.report_date.desc()).offset((page - 1) * page_size).limit(page_size)
     items = (await db.execute(query)).scalars().all()
 
+    area_ids = list(set(r.area_id for r in items if r.area_id is not None))
+    area_name_map: dict = {}
+    if area_ids:
+        area_result = await db.execute(select(Area).where(Area.id.in_(area_ids)))
+        areas = area_result.scalars().all()
+        area_name_map = {a.id: a.name for a in areas}
+
+    result_items = []
+    for r in items:
+        info = DailyReportInfo.model_validate(r)
+        info.area_name = area_name_map.get(r.area_id, "全局") if r.area_id else "全局"
+        result_items.append(info)
+
     return DailyReportListResponse(
         total=total, page=page, page_size=page_size,
         total_pages=(total + page_size - 1) // page_size,
-        items=[DailyReportInfo.model_validate(r) for r in items]
+        items=result_items
     )
 
 
@@ -866,6 +889,7 @@ async def export_excel(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     area_id: Optional[int] = None,
+    is_global: Optional[bool] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
     query = select(DailyReport)
@@ -873,7 +897,12 @@ async def export_excel(
         query = query.where(DailyReport.report_date >= start_date)
     if end_date:
         query = query.where(DailyReport.report_date <= end_date)
-    if area_id:
+    if is_global is not None:
+        if is_global:
+            query = query.where(DailyReport.area_id.is_(None))
+        else:
+            query = query.where(DailyReport.area_id.is_not(None))
+    elif area_id is not None:
         query = query.where(DailyReport.area_id == area_id)
     query = query.order_by(DailyReport.report_date.asc(), DailyReport.area_id.asc().nullslast())
     items = (await db.execute(query)).scalars().all()
@@ -898,10 +927,11 @@ async def export_excel(
 
     from openpyxl.styles import Font
     header_font = Font(bold=True)
+    global_font = Font(bold=True)
     for col_idx in range(1, len(headers) + 1):
         ws.cell(row=1, column=col_idx).font = header_font
 
-    for r in items:
+    for row_idx, r in enumerate(items, start=2):
         area_name = area_name_map.get(r.area_id, "全局") if r.area_id else "全局"
         ws.append([
             str(r.report_date),
@@ -921,10 +951,15 @@ async def export_excel(
             r.overdue_bill_count,
             float(r.revenue)
         ])
+        if r.area_id is None:
+            ws.cell(row=row_idx, column=2).font = global_font
 
     for col in range(1, len(headers) + 1):
         col_letter = chr(64 + col) if col <= 26 else chr(64 + (col - 1) // 26) + chr(65 + (col - 1) % 26)
-        ws.column_dimensions[col_letter].width = 16
+        if col == 2:
+            ws.column_dimensions[col_letter].width = 20
+        else:
+            ws.column_dimensions[col_letter].width = 16
 
     buf = BytesIO()
     wb.save(buf)

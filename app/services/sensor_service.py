@@ -139,7 +139,7 @@ async def handle_leak_detection(
         work_order_id = work_order.id
 
         try:
-            await assign_work_order(db, work_order)
+            await assign_work_order(db, work_order, prefer_area_id=warning.area_id)
             await db.flush()
         except Exception as e:
             logger.error(f"工单分配失败: work_order_id={work_order.id}, error={e}", exc_info=True)
@@ -303,13 +303,12 @@ async def predict_demand(
 
 
 async def generate_daily_report(db: AsyncSession, report_date: date, area_id: Optional[int] = None) -> DailyReport:
-    existing_query = select(DailyReport).where(
-        and_(
-            DailyReport.report_date == report_date,
-            DailyReport.area_id.is_(None) if area_id is None else DailyReport.area_id == area_id
-        )
-    )
-    existing = await db.execute(existing_query)
+    conditions = [DailyReport.report_date == report_date]
+    if area_id is None:
+        conditions.append(DailyReport.area_id.is_(None))
+    else:
+        conditions.append(DailyReport.area_id == area_id)
+    existing = await db.execute(select(DailyReport).where(and_(*conditions)))
     report = existing.scalar_one_or_none()
 
     start_dt = datetime.combine(report_date, time.min)
@@ -445,4 +444,16 @@ async def generate_daily_report(db: AsyncSession, report_date: date, area_id: Op
 
     await db.commit()
     await db.refresh(report)
+
+    verify_conditions = [DailyReport.report_date == report_date]
+    if area_id is None:
+        verify_conditions.append(DailyReport.area_id.is_(None))
+    else:
+        verify_conditions.append(DailyReport.area_id == area_id)
+    verify_result = await db.execute(select(DailyReport).where(and_(*verify_conditions)))
+    verified = verify_result.scalar_one_or_none()
+    if not verified or verified.id != report.id:
+        logger.error(f"日报生成后校验失败: report_date={report_date}, area_id={area_id}, report_id={report.id}")
+        raise RuntimeError(f"日报生成校验失败，(report_date={report_date}, area_id={area_id}) 组合不存在或不匹配")
+
     return report

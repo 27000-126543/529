@@ -148,7 +148,8 @@ def generate_monthly_bills():
         )
         accounts = list(accounts_result.scalars().all())
 
-        count = 0
+        actual_count = 0
+        failed_count = 0
         for acc in accounts:
             try:
                 existing = db.execute(
@@ -199,26 +200,26 @@ def generate_monthly_bills():
                         bill.id, "bill"
                     )
 
-                count += 1
+                db.commit()
+                actual_count += 1
             except Exception as e:
                 logger.error(f"生成账单失败: account_id={acc.id}, error={e}")
                 db.rollback()
+                failed_count += 1
                 continue
-
-        db.commit()
 
         dispatchers = _get_dispatchers(db, 3)
         for did in dispatchers:
             _create_notification_sync(
                 db, did, NotificationType.SYSTEM,
                 f"月度账单生成完成",
-                f"账期: {billing_month}，共生成 {count} 份账单",
+                f"账期: {billing_month}，共生成 {actual_count} 份账单（成功{actual_count}条，失败{failed_count}条）",
                 None, "monthly_billing"
             )
         db.commit()
 
-        logger.info(f"generate_monthly_bills: 生成了 {count} 份账单")
-        return {"month": billing_month, "generated": count}
+        logger.info(f"generate_monthly_bills: 生成了 {actual_count} 份账单（成功{actual_count}条，失败{failed_count}条）")
+        return {"month": billing_month, "generated": actual_count, "failed": failed_count}
     except Exception as e:
         logger.error(f"generate_monthly_bills error: {e}")
         db.rollback()
@@ -246,21 +247,23 @@ def check_overdue_bills():
         )
         bills = list(bills_result.scalars().all())
 
-        bills_updated = 0
-        restricted = 0
+        actual_bills_updated = 0
+        actual_restricted = 0
+        failed_count = 0
         for bill in bills:
             try:
                 bill.status = "overdue"
                 bill.restriction_issued = True
                 bill.restricted_at = now
 
+                restricted_this_one = 0
                 acc = db.execute(
                     select(ResidentAccount).where(ResidentAccount.id == bill.account_id)
                 ).scalar_one_or_none()
                 if acc:
                     acc.gas_status = "restricted"
                     acc.gas_restricted_at = now
-                    restricted += 1
+                    restricted_this_one = 1
 
                     if acc.user_id:
                         _create_notification_sync(
@@ -286,26 +289,27 @@ def check_overdue_bills():
                         bill.id, "collection_task"
                     )
 
-                bills_updated += 1
+                db.commit()
+                actual_bills_updated += 1
+                actual_restricted += restricted_this_one
             except Exception as e:
                 logger.error(f"处理欠费账单失败: bill_id={bill.id}, error={e}")
                 db.rollback()
+                failed_count += 1
                 continue
-
-        db.commit()
 
         dispatchers = _get_dispatchers(db, 3)
         for did in dispatchers:
             _create_notification_sync(
                 db, did, NotificationType.SYSTEM,
                 f"欠费账单检查完成",
-                f"已更新 {bills_updated} 份逾期账单，对 {restricted} 户执行限气",
+                f"已更新 {actual_bills_updated} 份逾期账单，对 {actual_restricted} 户执行限气（成功{actual_bills_updated}条，失败{failed_count}条）",
                 None, "overdue_bills"
             )
         db.commit()
 
-        logger.info(f"check_overdue_bills: 更新了 {bills_updated} 账单，限气 {restricted} 账户")
-        return {"bills_overdue": bills_updated, "accounts_restricted": restricted}
+        logger.info(f"check_overdue_bills: 更新了 {actual_bills_updated} 账单，限气 {actual_restricted} 账户（成功{actual_bills_updated}条，失败{failed_count}条）")
+        return {"bills_overdue": actual_bills_updated, "accounts_restricted": actual_restricted, "failed": failed_count}
     except Exception as e:
         logger.error(f"check_overdue_bills error: {e}")
         db.rollback()
