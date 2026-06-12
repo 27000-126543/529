@@ -32,6 +32,16 @@ def _create_notification_sync(db, user_id, type, title, content=None, related_id
     return notification
 
 
+def _get_dispatchers(db, limit=3):
+    from sqlalchemy import select, and_
+    result = db.execute(
+        select(User.id).where(
+            and_(User.role == UserRole.DISPATCHER, User.is_active == True)
+        )
+    )
+    return list(result.scalars().all())[:limit]
+
+
 def _get_active_price_tiers(db, effective_date=None):
     if not effective_date:
         effective_date = date.today()
@@ -134,7 +144,7 @@ def generate_monthly_bills():
             billing_end = date(year, month + 1, 1) - timedelta(days=1)
 
         accounts_result = db.execute(
-            select(ResidentAccount).where(ResidentAccount.gas_status != GasStatus.SUSPENDED)
+            select(ResidentAccount).where(ResidentAccount.gas_status != "suspended")
         )
         accounts = list(accounts_result.scalars().all())
 
@@ -172,7 +182,7 @@ def generate_monthly_bills():
                     previous_reading=previous_reading,
                     current_reading=current_reading,
                     due_date=due_date,
-                    status=BillStatus.UNPAID,
+                    status="unpaid",
                     **calc
                 )
                 db.add(bill)
@@ -196,6 +206,17 @@ def generate_monthly_bills():
                 continue
 
         db.commit()
+
+        dispatchers = _get_dispatchers(db, 3)
+        for did in dispatchers:
+            _create_notification_sync(
+                db, did, NotificationType.SYSTEM,
+                f"月度账单生成完成",
+                f"账期: {billing_month}，共生成 {count} 份账单",
+                None, "monthly_billing"
+            )
+        db.commit()
+
         logger.info(f"generate_monthly_bills: 生成了 {count} 份账单")
         return {"month": billing_month, "generated": count}
     except Exception as e:
@@ -218,7 +239,7 @@ def check_overdue_bills():
             select(Bill).where(
                 and_(
                     Bill.due_date < cutoff,
-                    Bill.status.in_([BillStatus.UNPAID, BillStatus.PARTIAL]),
+                    Bill.status.in_(["unpaid", "partial"]),
                     Bill.restriction_issued == False
                 )
             )
@@ -229,7 +250,7 @@ def check_overdue_bills():
         restricted = 0
         for bill in bills:
             try:
-                bill.status = BillStatus.OVERDUE
+                bill.status = "overdue"
                 bill.restriction_issued = True
                 bill.restricted_at = now
 
@@ -237,7 +258,7 @@ def check_overdue_bills():
                     select(ResidentAccount).where(ResidentAccount.id == bill.account_id)
                 ).scalar_one_or_none()
                 if acc:
-                    acc.gas_status = GasStatus.RESTRICTED
+                    acc.gas_status = "restricted"
                     acc.gas_restricted_at = now
                     restricted += 1
 
@@ -272,6 +293,17 @@ def check_overdue_bills():
                 continue
 
         db.commit()
+
+        dispatchers = _get_dispatchers(db, 3)
+        for did in dispatchers:
+            _create_notification_sync(
+                db, did, NotificationType.SYSTEM,
+                f"欠费账单检查完成",
+                f"已更新 {bills_updated} 份逾期账单，对 {restricted} 户执行限气",
+                None, "overdue_bills"
+            )
+        db.commit()
+
         logger.info(f"check_overdue_bills: 更新了 {bills_updated} 账单，限气 {restricted} 账户")
         return {"bills_overdue": bills_updated, "accounts_restricted": restricted}
     except Exception as e:

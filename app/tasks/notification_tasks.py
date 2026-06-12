@@ -31,7 +31,7 @@ def _create_notification_sync(db, user_id, type, title, content=None, related_id
     return notification
 
 
-def _get_dispatchers(db, limit=5):
+def _get_dispatchers(db, limit=3):
     result = db.execute(
         select(User.id).where(
             and_(User.role == UserRole.DISPATCHER, User.is_active == True)
@@ -113,11 +113,7 @@ def check_overdue_work_orders():
         result = db.execute(
             select(WorkOrder).where(
                 and_(
-                    WorkOrder.status.in_([
-                        WorkOrderStatus.PENDING,
-                        WorkOrderStatus.ASSIGNED,
-                        WorkOrderStatus.ACCEPTED
-                    ]),
+                    WorkOrder.status.in_(["pending", "assigned", "accepted"]),
                     WorkOrder.created_at < threshold,
                     or_(
                         WorkOrder.escalation_count == 0,
@@ -132,7 +128,7 @@ def check_overdue_work_orders():
         count = 0
         for wo in orders:
             try:
-                wo.status = WorkOrderStatus.ESCALATED
+                wo.status = "escalated"
                 wo.escalated_at = now
                 wo.escalation_count = (wo.escalation_count or 0) + 1
                 wo.level = _escalate_level(wo.level or WarningLevel.LEVEL_1)
@@ -157,7 +153,7 @@ def check_overdue_work_orders():
                         new_user = _find_available_user_in_team(db, new_team.id)
                         if new_user:
                             wo.assignee_id = new_user.id
-                            wo.status = WorkOrderStatus.ASSIGNED
+                            wo.status = "assigned"
                             wo.assigned_at = now
 
                             assignment = WorkOrderAssignment(
@@ -181,7 +177,7 @@ def check_overdue_work_orders():
                         wo.id, "work_order_escalation"
                     )
 
-                dispatchers = _get_dispatchers(db, 5)
+                dispatchers = _get_dispatchers(db, 3)
                 for did in dispatchers:
                     _create_notification_sync(
                         db, did, NotificationType.WARNING,
@@ -205,6 +201,17 @@ def check_overdue_work_orders():
                 continue
 
         db.commit()
+
+        dispatchers = _get_dispatchers(db, 3)
+        for did in dispatchers:
+            _create_notification_sync(
+                db, did, NotificationType.SYSTEM,
+                f"超时工单自动升级完成",
+                f"共升级 {count} 个超时工单",
+                None, "work_order_escalation"
+            )
+        db.commit()
+
         logger.info(f"check_overdue_work_orders: 升级了 {count} 个工单")
         return {"escalated": count}
     except Exception as e:
@@ -225,7 +232,7 @@ def check_approval_reminders():
         result = db.execute(
             select(ApprovalRecord).where(
                 and_(
-                    ApprovalRecord.status == ApprovalStatus.PENDING,
+                    ApprovalRecord.status == "pending",
                     ApprovalRecord.submitted_at < threshold
                 )
             )
@@ -259,6 +266,17 @@ def check_approval_reminders():
                 continue
 
         db.commit()
+
+        dispatchers = _get_dispatchers(db, 3)
+        for did in dispatchers:
+            _create_notification_sync(
+                db, did, NotificationType.SYSTEM,
+                f"审批催办完成",
+                f"共催办 {reminded} 条超时审批",
+                None, "approval_reminder"
+            )
+        db.commit()
+
         logger.info(f"check_approval_reminders: 催办了 {reminded} 条审批")
         return {"reminded": reminded}
     except Exception as e:
@@ -288,7 +306,7 @@ def auto_adjust_pressure_stations():
                     select(Sensor).where(
                         and_(
                             Sensor.pressure_station_id == station.id,
-                            Sensor.type == SensorType.PRESSURE
+                            Sensor.type == "pressure"
                         )
                     )
                 )
@@ -364,6 +382,17 @@ def auto_adjust_pressure_stations():
                 continue
 
         db.commit()
+
+        dispatchers = _get_dispatchers(db, 3)
+        for did in dispatchers:
+            _create_notification_sync(
+                db, did, NotificationType.SYSTEM,
+                f"调压站自动调节完成",
+                f"共调节 {adjusted} 个调压站",
+                None, "pressure_adjust"
+            )
+        db.commit()
+
         logger.info(f"auto_adjust_pressure_stations: 调节了 {adjusted} 个调压站")
         return {"adjusted": adjusted}
     except Exception as e:

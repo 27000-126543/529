@@ -90,12 +90,32 @@ def _get_work_order_stats(db, report_date, area_id=None):
         query = query.where(WorkOrder.area_id == area_id)
     orders = list(db.execute(query).scalars().all())
     count = len(orders)
-    completed = sum(1 for o in orders if o.status == WorkOrderStatus.COMPLETED)
+    completed = sum(1 for o in orders if o.status == "completed")
     response_times = [o.response_minutes for o in orders if o.response_minutes is not None]
     avg_response = Decimal(str(sum(response_times) / len(response_times))) if response_times else Decimal("0")
     resolution_times = [o.resolution_minutes for o in orders if o.resolution_minutes is not None]
     avg_resolution = Decimal(str(sum(resolution_times) / len(resolution_times))) if resolution_times else Decimal("0")
     return count, completed, avg_response, avg_resolution
+
+
+def _get_peak_hour_volume(db, report_date, area_id=None):
+    from app.config import settings
+    start_dt = datetime.combine(report_date, datetime.min.time())
+    end_dt = start_dt + timedelta(days=1)
+    query = select(func.coalesce(func.sum(SensorReading.value), Decimal("0"))).select_from(
+        SensorReading
+    ).join(Sensor, Sensor.id == SensorReading.sensor_id).where(
+        and_(
+            Sensor.type == SensorType.FLOW,
+            SensorReading.reading_time >= start_dt,
+            SensorReading.reading_time < end_dt,
+            extract("hour", SensorReading.reading_time).in_(settings.PEAK_HOURS)
+        )
+    )
+    if area_id:
+        query = query.where(Sensor.area_id == area_id)
+    result = db.execute(query).scalar_one()
+    return result
 
 
 def _get_overdue_bill_count(db, report_date, area_id=None):
@@ -135,12 +155,13 @@ def _upsert_daily_report(db, report_date, area_id, stats):
         select(DailyReport).where(
             and_(
                 DailyReport.report_date == report_date,
-                DailyReport.area_id == area_id if area_id is not None else DailyReport.area_id.is_(None)
+                DailyReport.area_id.is_(None) if area_id is None else DailyReport.area_id == area_id
             )
         )
     ).scalar_one_or_none()
     if existing:
         existing.total_gas_volume = stats["total_gas_volume"]
+        existing.peak_hour_volume = stats["peak_hour_volume"]
         existing.leak_count = stats["leak_count"]
         existing.leak_resolved = stats["leak_resolved"]
         existing.leak_detection_rate = stats["leak_detection_rate"]
@@ -150,12 +171,16 @@ def _upsert_daily_report(db, report_date, area_id, stats):
         existing.avg_resolution_minutes = stats["avg_resolution_minutes"]
         existing.overdue_bill_count = stats["overdue_bill_count"]
         existing.revenue = stats["revenue"]
+        existing.complaint_count = 0
+        existing.complaint_rate = Decimal("0")
+        existing.new_connection_count = 0
         return existing
     else:
         report = DailyReport(
             report_date=report_date,
             area_id=area_id,
             total_gas_volume=stats["total_gas_volume"],
+            peak_hour_volume=stats["peak_hour_volume"],
             leak_count=stats["leak_count"],
             leak_resolved=stats["leak_resolved"],
             leak_detection_rate=stats["leak_detection_rate"],
@@ -163,6 +188,9 @@ def _upsert_daily_report(db, report_date, area_id, stats):
             work_order_completed=stats["work_order_completed"],
             avg_response_minutes=stats["avg_response_minutes"],
             avg_resolution_minutes=stats["avg_resolution_minutes"],
+            complaint_count=0,
+            complaint_rate=Decimal("0"),
+            new_connection_count=0,
             overdue_bill_count=stats["overdue_bill_count"],
             revenue=stats["revenue"]
         )
@@ -184,6 +212,7 @@ def generate_daily_reports():
         for area_id in area_ids:
             try:
                 total_gas = _get_total_gas_volume(db, report_date, area_id)
+                peak_gas = _get_peak_hour_volume(db, report_date, area_id)
                 leak_count, leak_resolved, leak_rate = _get_leak_stats(db, report_date, area_id)
                 wo_count, wo_completed, avg_resp, avg_res = _get_work_order_stats(db, report_date, area_id)
                 overdue_bills = _get_overdue_bill_count(db, report_date, area_id)
@@ -191,6 +220,7 @@ def generate_daily_reports():
 
                 stats = {
                     "total_gas_volume": total_gas,
+                    "peak_hour_volume": peak_gas,
                     "leak_count": leak_count,
                     "leak_resolved": leak_resolved,
                     "leak_detection_rate": leak_rate,
@@ -215,7 +245,7 @@ def generate_daily_reports():
             _create_notification_sync(
                 db, did, NotificationType.SYSTEM,
                 f"每日运行报表已生成",
-                f"报表日期: {report_date}，共生成 {generated} 份区域报表",
+                f"报表日期: {report_date}，共生成 {generated} 份区域报表，包括全局和 {len(areas)} 个区域",
                 None, "daily_report"
             )
         db.commit()

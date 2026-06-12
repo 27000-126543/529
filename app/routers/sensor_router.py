@@ -107,14 +107,33 @@ async def submit_reading(
     data: SensorReadingCreate,
     db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(select(Sensor).where(Sensor.id == data.sensor_id))
-    sensor = result.scalar_one_or_none()
-    if not sensor:
-        raise HTTPException(status_code=404, detail="传感器不存在")
+    try:
+        result = await db.execute(select(Sensor).where(Sensor.id == data.sensor_id))
+        sensor = result.scalar_one_or_none()
+        if not sensor:
+            raise HTTPException(status_code=404, detail="传感器不存在")
 
-    reading = await sensor_service.process_sensor_reading(db, sensor, data.value, data.reading_time)
-    await db.commit()
-    return {"success": True, "reading_id": reading.id, "is_anomaly": reading.is_anomaly}
+        reading, warning_id, work_order_id = await sensor_service.process_sensor_reading(
+            db, sensor, data.value, data.reading_time
+        )
+        await db.commit()
+
+        response_data = {
+            "success": True,
+            "reading_id": reading.id,
+            "is_anomaly": reading.is_anomaly
+        }
+        if warning_id is not None:
+            response_data["warning_id"] = warning_id
+        if work_order_id is not None:
+            response_data["work_order_id"] = work_order_id
+        return response_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"提交传感器读数失败: sensor_id={data.sensor_id}, error={e}", exc_info=True)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
 
 
 @router.post("/readings/batch", status_code=201)
@@ -122,24 +141,69 @@ async def submit_batch_readings(
     batch: SensorReadingBatch,
     db: AsyncSession = Depends(get_db)
 ):
-    sensor_ids = {r.sensor_id for r in batch.readings}
-    result = await db.execute(select(Sensor).where(Sensor.id.in_(list(sensor_ids))))
-    sensors = {s.id: s for s in result.scalars().all()}
+    try:
+        sensor_ids = {r.sensor_id for r in batch.readings}
+        result = await db.execute(select(Sensor).where(Sensor.id.in_(list(sensor_ids))))
+        sensors = {s.id: s for s in result.scalars().all()}
 
-    anomaly_count = 0
-    for r in batch.readings:
-        sensor = sensors.get(r.sensor_id)
-        if sensor:
-            try:
-                reading = await sensor_service.process_sensor_reading(db, sensor, r.value, r.reading_time)
-                if reading.is_anomaly:
-                    anomaly_count += 1
-            except Exception as e:
-                logger.error(f"处理传感器读数失败: sensor_id={r.sensor_id}, error={e}")
+        anomaly_count = 0
+        success_count = 0
+        failed_count = 0
+        reading_results = []
+
+        for r in batch.readings:
+            sensor = sensors.get(r.sensor_id)
+            if not sensor:
+                failed_count += 1
+                reading_results.append({
+                    "sensor_id": r.sensor_id,
+                    "success": False,
+                    "error": "传感器不存在"
+                })
                 continue
 
-    await db.commit()
-    return {"success": True, "total": len(batch.readings), "anomaly_count": anomaly_count}
+            try:
+                reading, warning_id, work_order_id = await sensor_service.process_sensor_reading(
+                    db, sensor, r.value, r.reading_time
+                )
+                if reading.is_anomaly:
+                    anomaly_count += 1
+                success_count += 1
+
+                result_item = {
+                    "sensor_id": r.sensor_id,
+                    "success": True,
+                    "reading_id": reading.id,
+                    "is_anomaly": reading.is_anomaly
+                }
+                if warning_id is not None:
+                    result_item["warning_id"] = warning_id
+                if work_order_id is not None:
+                    result_item["work_order_id"] = work_order_id
+                reading_results.append(result_item)
+            except Exception as e:
+                logger.error(f"处理传感器读数失败: sensor_id={r.sensor_id}, error={e}", exc_info=True)
+                failed_count += 1
+                reading_results.append({
+                    "sensor_id": r.sensor_id,
+                    "success": False,
+                    "error": str(e)
+                })
+                continue
+
+        await db.commit()
+        return {
+            "success": True,
+            "total": len(batch.readings),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "anomaly_count": anomaly_count,
+            "results": reading_results
+        }
+    except Exception as e:
+        logger.error(f"批量提交传感器读数失败: error={e}", exc_info=True)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
 
 
 @router.get("/readings/{sensor_id}", response_model=SensorReadingListResponse)
@@ -296,6 +360,7 @@ warning_router = APIRouter(prefix="/api/v1/warnings", tags=["泄漏预警"])
 async def list_leak_warnings(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
+    warning_id: Optional[int] = None,
     area_id: Optional[int] = None,
     level: Optional[WarningLevel] = None,
     status: Optional[str] = None,
@@ -305,6 +370,8 @@ async def list_leak_warnings(
     current_user: User = Depends(get_current_user)
 ):
     query = select(LeakWarning)
+    if warning_id:
+        query = query.where(LeakWarning.id == warning_id)
     if area_id:
         query = query.where(LeakWarning.area_id == area_id)
     elif current_user.area_id and current_user.role in [UserRole.AREA_MANAGER, UserRole.MAINTENANCE]:
@@ -386,6 +453,8 @@ async def create_work_order(
 async def list_work_orders(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
+    warning_id: Optional[int] = None,
+    resident_report_id: Optional[int] = None,
     type: Optional[WorkOrderType] = None,
     status: Optional[WorkOrderStatus] = None,
     area_id: Optional[int] = None,
@@ -398,6 +467,10 @@ async def list_work_orders(
     current_user: User = Depends(get_current_user)
 ):
     query = select(WorkOrder)
+    if warning_id:
+        query = query.where(WorkOrder.warning_id == warning_id)
+    if resident_report_id:
+        query = query.where(WorkOrder.resident_report_id == resident_report_id)
     if type:
         query = query.where(WorkOrder.type == type)
     if status:

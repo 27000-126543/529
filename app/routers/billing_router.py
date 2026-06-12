@@ -26,7 +26,7 @@ from app.schemas.billing import (
     GasPurchasePlanCreate, GasPurchasePlanInfo, GasPurchasePlanListResponse,
     DailyReportInfo, DailyReportListResponse
 )
-from app.schemas.common import IdResponse, SuccessResponse
+from app.schemas.common import IdResponse, SuccessResponse, ProjectCreateResponse, FinalApprovalResponse, ProjectDetailResponse
 from app.utils.security import get_current_user, require_roles, generate_order_no
 from app.services import billing_service, project_service, sensor_service, notification_service, work_order_service
 from app.schemas.sensor import WorkOrderCreate
@@ -362,39 +362,48 @@ async def create_meter_reading(
 project_router = APIRouter(prefix="/api/v1/projects", tags=["工程改造审批"])
 
 
-@project_router.post("", response_model=IdResponse)
+@project_router.post("", response_model=ProjectCreateResponse)
 async def create_project(
     data: EngineeringProjectCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    project = await project_service.create_project(db, data, applicant_id=current_user.id)
+    try:
+        project = await project_service.create_project(db, data, applicant_id=current_user.id)
 
-    safety_stages = await db.execute(
-        select(ApprovalRecord).where(
-            and_(
-                ApprovalRecord.project_id == project.id,
-                ApprovalRecord.stage == ApprovalStage.SAFETY
+        safety_stages = await db.execute(
+            select(ApprovalRecord).where(
+                and_(
+                    ApprovalRecord.project_id == project.id,
+                    ApprovalRecord.stage == ApprovalStage.SAFETY
+                )
             )
         )
-    )
-    stage = safety_stages.scalar_one_or_none()
-    if stage:
-        area_result = await db.execute(select(User).where(
-            and_(User.role == UserRole.SAFETY_INSPECTOR, User.is_active == True)
-        ))
-        safety_users = area_result.scalars().all()
-        for u in safety_users[:5]:
-            await notification_service.create_notification(
-                db, u.id, NotificationType.APPROVAL,
-                f"待审批: {data.name}",
-                f"工程编号: {project.project_no}，请及时审批",
-                project.id, "project"
-            )
+        stage = safety_stages.scalar_one_or_none()
+        if stage:
+            area_result = await db.execute(select(User).where(
+                and_(User.role == UserRole.SAFETY_INSPECTOR, User.is_active == True)
+            ))
+            safety_users = area_result.scalars().all()
+            for u in safety_users[:5]:
+                await notification_service.create_notification(
+                    db, u.id, NotificationType.APPROVAL,
+                    f"待审批: {data.name}",
+                    f"工程编号: {project.project_no}，请及时审批",
+                    project.id, "project"
+                )
 
-    await db.commit()
-    await db.refresh(project)
-    return IdResponse(id=project.id)
+        await db.commit()
+        await db.refresh(project)
+        return ProjectCreateResponse(
+            success=True,
+            project_id=project.id,
+            project_no=project.project_no,
+            message="申报成功"
+        )
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"申报失败: {str(e)}")
 
 
 @project_router.get("", response_model=EngineeringProjectListResponse)
@@ -426,16 +435,75 @@ async def list_projects(
     )
 
 
-@project_router.get("/{project_id}", response_model=EngineeringProjectInfo)
+@project_router.get("/{project_id}", response_model=ProjectDetailResponse)
 async def get_project(project_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(EngineeringProject).where(EngineeringProject.id == project_id))
-    p = result.scalar_one_or_none()
-    if not p:
-        raise HTTPException(status_code=404, detail="工程项目不存在")
-    return EngineeringProjectInfo.model_validate(p)
+    try:
+        result = await db.execute(select(EngineeringProject).where(EngineeringProject.id == project_id))
+        p = result.scalar_one_or_none()
+        if not p:
+            raise HTTPException(status_code=404, detail="工程项目不存在")
+
+        approvals_result = await db.execute(
+            select(ApprovalRecord).where(ApprovalRecord.project_id == project_id).order_by(ApprovalRecord.id)
+        )
+        approvals = approvals_result.scalars().all()
+
+        stages_order = [
+            ApprovalStage.SAFETY,
+            ApprovalStage.DESIGN,
+            ApprovalStage.ENGINEERING,
+            ApprovalStage.FINAL
+        ]
+
+        approval_flow_status = "审批中"
+        if p.approval_status == ApprovalStatus.REJECTED:
+            approval_flow_status = "已驳回"
+        elif p.approval_status == ApprovalStatus.APPROVED:
+            approval_flow_status = "已通过"
+        else:
+            for i, stage in enumerate(stages_order):
+                stage_approval = next((a for a in approvals if a.stage == stage), None)
+                if stage_approval:
+                    if stage_approval.status == ApprovalStatus.PENDING:
+                        stage_names = {
+                            ApprovalStage.SAFETY: "安监审批",
+                            ApprovalStage.DESIGN: "设计审批",
+                            ApprovalStage.ENGINEERING: "工程审批",
+                            ApprovalStage.FINAL: "终审"
+                        }
+                        approval_flow_status = f"待{stage_names.get(stage, stage.value)}"
+                        break
+                    elif stage_approval.status == ApprovalStatus.REJECTED:
+                        approval_flow_status = "已驳回"
+                        break
+
+        return ProjectDetailResponse(
+            id=p.id,
+            project_no=p.project_no,
+            name=p.name,
+            area_id=p.area_id,
+            applicant_id=p.applicant_id,
+            project_type=p.project_type,
+            scope=p.scope,
+            budget=p.budget,
+            planned_start_date=p.planned_start_date,
+            planned_end_date=p.planned_end_date,
+            current_stage=p.current_stage,
+            approval_status=p.approval_status,
+            construction_team_id=p.construction_team_id,
+            actual_start_date=p.actual_start_date,
+            actual_end_date=p.actual_end_date,
+            status=p.status,
+            created_at=p.created_at,
+            approval_flow_status=approval_flow_status
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取项目详情失败: {str(e)}")
 
 
-@project_router.post("/{project_id}/approval", response_model=SuccessResponse)
+@project_router.post("/{project_id}/approval", response_model=None)
 async def process_approval(
     project_id: int,
     stage: ApprovalStage,
@@ -449,21 +517,38 @@ async def process_approval(
         ApprovalStage.ENGINEERING: [UserRole.ENGINEER, UserRole.ADMIN],
         ApprovalStage.FINAL: [UserRole.ADMIN, UserRole.DISPATCHER]
     }
-    if current_user.role not in required_roles.get(stage, [UserRole.ADMIN]):
-        raise HTTPException(status_code=403, detail=f"无权限处理 {stage.value} 阶段审批")
+    allowed_roles = required_roles.get(stage, [UserRole.ADMIN])
+    if current_user.role not in allowed_roles:
+        raise HTTPException(status_code=403, detail=f"无权限处理 {stage.value} 阶段审批，需要角色: {[r.value for r in allowed_roles]}")
 
     try:
         record = await project_service.approve_stage(
             db, project_id, stage, current_user.id, data.status, data.comment
         )
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        await db.rollback()
+        error_msg = str(e)
+        if "上一阶段" in error_msg:
+            raise HTTPException(status_code=400, detail=error_msg)
+        elif "已被处理" in error_msg:
+            raise HTTPException(status_code=409, detail=error_msg)
+        elif "不存在" in error_msg:
+            raise HTTPException(status_code=404, detail=error_msg)
+        else:
+            raise HTTPException(status_code=400, detail=error_msg)
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"审批失败: {str(e)}")
 
     project_result = await db.execute(select(EngineeringProject).where(EngineeringProject.id == project_id))
     project = project_result.scalar_one_or_none()
-    if project and data.status == ApprovalStatus.APPROVED:
+    if not project:
+        await db.rollback()
+        raise HTTPException(status_code=404, detail="工程项目不存在")
+
+    if data.status == ApprovalStatus.APPROVED:
         next_stage = project.current_stage
-        if next_stage:
+        if next_stage and next_stage != stage:
             notify_role = {
                 ApprovalStage.SAFETY: UserRole.SAFETY_INSPECTOR,
                 ApprovalStage.DESIGN: UserRole.DESIGNER,
@@ -482,7 +567,7 @@ async def process_approval(
                         project.id, "project"
                     )
 
-    if project and project.applicant_id:
+    if project.applicant_id:
         await notification_service.create_notification(
             db, project.applicant_id, NotificationType.APPROVAL,
             f"审批结果: {project.name}",
@@ -491,16 +576,62 @@ async def process_approval(
         )
 
     await db.commit()
+    await db.refresh(project)
+
+    if stage == ApprovalStage.FINAL and data.status == ApprovalStatus.APPROVED:
+        return FinalApprovalResponse(
+            success=True,
+            message=f"审批已{data.status.value}",
+            construction_team_id=project.construction_team_id,
+            actual_start_date=project.actual_start_date,
+            status=project.status
+        )
+
     return SuccessResponse(message=f"审批已{data.status.value}")
 
 
 @project_router.get("/{project_id}/approvals", response_model=List[ApprovalRecordInfo])
 async def get_project_approvals(project_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(ApprovalRecord).where(ApprovalRecord.project_id == project_id).order_by(ApprovalRecord.id)
-    )
-    records = result.scalars().all()
-    return [ApprovalRecordInfo.model_validate(r) for r in records]
+    try:
+        project_result = await db.execute(
+            select(EngineeringProject).where(EngineeringProject.id == project_id)
+        )
+        project = project_result.scalar_one_or_none()
+        if not project:
+            raise HTTPException(status_code=404, detail="工程项目不存在")
+
+        stages_order = [
+            ApprovalStage.SAFETY,
+            ApprovalStage.DESIGN,
+            ApprovalStage.ENGINEERING,
+            ApprovalStage.FINAL
+        ]
+
+        result = await db.execute(
+            select(ApprovalRecord).where(ApprovalRecord.project_id == project_id).order_by(ApprovalRecord.id)
+        )
+        records = result.scalars().all()
+
+        record_map = {r.stage: r for r in records}
+        ordered_records = []
+        for stage in stages_order:
+            if stage in record_map:
+                ordered_records.append(record_map[stage])
+            else:
+                dummy_record = ApprovalRecord(
+                    project_id=project_id,
+                    stage=stage,
+                    approver_id=0,
+                    status=ApprovalStatus.PENDING,
+                    submitted_at=datetime.utcnow()
+                )
+                ordered_records.append(dummy_record)
+
+        return [ApprovalRecordInfo.model_validate(r) for r in ordered_records]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取审批记录失败: {str(e)}")
 
 
 purchase_router = APIRouter(prefix="/api/v1/purchase", tags=["气源采购"])
@@ -744,7 +875,7 @@ async def export_excel(
         query = query.where(DailyReport.report_date <= end_date)
     if area_id:
         query = query.where(DailyReport.area_id == area_id)
-    query = query.order_by(DailyReport.report_date.desc())
+    query = query.order_by(DailyReport.report_date.asc(), DailyReport.area_id.asc().nullslast())
     items = (await db.execute(query)).scalars().all()
 
     area_ids = list(set(r.area_id for r in items if r.area_id is not None))
@@ -799,7 +930,8 @@ async def export_excel(
     wb.save(buf)
     buf.seek(0)
 
-    filename = f"gas_daily_report_{start_date or 'all'}_to_{end_date or 'all'}.xlsx"
+    date_range = f"{start_date}_to_{end_date}" if start_date and end_date else (f"from_{start_date}" if start_date else (f"to_{end_date}" if end_date else "all"))
+    filename = f"gas_daily_report_{date_range}.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

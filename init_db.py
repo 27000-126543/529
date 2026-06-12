@@ -3,13 +3,15 @@ import os
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
+from sqlalchemy import select, func
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.database import Base, sync_engine, SyncSessionLocal
 from app.models import (
     User, UserRole, Area, MaintenanceTeam, PressureStation,
     Sensor, SensorType, GasPriceTier, GasSupplier, GasInventory,
-    ResidentAccount
+    ResidentAccount, GasStatus
 )
 from app.utils.security import hash_password
 
@@ -46,7 +48,8 @@ def seed_database():
         )
         db.add(admin)
         db.flush()
-        print(f"      ✅ 管理员: admin / Admin@123 (id={admin.id})")
+        db.commit()
+        print(f"      ✅ 管理员: admin / Admin@123 (id={admin.id}) - 已提交")
 
         print("[3/7] 创建区域数据...")
         areas_data = [
@@ -66,8 +69,10 @@ def seed_database():
             )
             db.add(area)
             area_objs.append(area)
+            print(f"      创建区域 {i + 1}/{len(areas_data)}: {a['name']}")
         db.flush()
-        print(f"      ✅ 创建了 {len(area_objs)} 个区域")
+        db.commit()
+        print(f"      ✅ 创建了 {len(area_objs)} 个区域 - 已提交")
 
         print("[4/7] 创建角色用户和维修队...")
         roles_config = [
@@ -81,6 +86,7 @@ def seed_database():
             (UserRole.RESIDENT, "居民用户", "resident"),
         ]
         users = [admin]
+        total_role_users = 0
         for i, (role, name_prefix, uname) in enumerate(roles_config):
             area_idx = i % len(area_objs)
             role_users_count = 3
@@ -98,8 +104,9 @@ def seed_database():
                 )
                 db.add(u)
                 users.append(u)
+                total_role_users += 1
+                print(f"      创建用户 {total_role_users}/{len(roles_config) * 3}: {u.username} ({name_prefix})")
         db.flush()
-        print(f"      ✅ 创建了 {len(users) - 1} 个角色用户")
 
         teams = []
         for i in range(min(3, len(area_objs))):
@@ -117,6 +124,7 @@ def seed_database():
             )
             db.add(team)
             teams.append(team)
+            print(f"      创建维修队 {i + 1}/{min(3, len(area_objs))}: {team.name}")
         db.flush()
 
         maintenance_users = [u for u in users if u.role == UserRole.MAINTENANCE]
@@ -133,7 +141,8 @@ def seed_database():
             if i < len(area_managers):
                 area.manager_id = area_managers[i].id
         db.flush()
-        print(f"      ✅ 创建了 {len(teams)} 个维修队，成员已分配")
+        db.commit()
+        print(f"      ✅ 创建了 {len(users) - 1} 个角色用户，{len(teams)} 个维修队 - 已提交")
 
         print("[5/7] 创建调压站和传感器...")
         stations = []
@@ -148,16 +157,18 @@ def seed_database():
                 outlet_pressure_min=Decimal("0.15"),
                 outlet_pressure_max=Decimal("0.25"),
                 capacity=Decimal("5000"),
-                longitude=Decimal(str(float(area.longitude) + i * 0.005))[:10],
-                latitude=Decimal(str(float(area.latitude) + i * 0.003))[:10],
+                longitude=Decimal(str(float(area.longitude) + i * 0.005)[:10]),
+                latitude=Decimal(str(float(area.latitude) + i * 0.003)[:10]),
                 status="normal",
                 created_at=datetime.utcnow()
             )
             db.add(station)
             stations.append(station)
+            print(f"      创建调压站 {i + 1}/{len(area_objs)}: {station.name}")
         db.flush()
 
         sensor_count = 0
+        total_sensors = len(stations) * 5
         for station in stations:
             sensors_config = [
                 (SensorType.PRESSURE, "入口压力传感器", "IP", Decimal("0.4"), Decimal("0.8")),
@@ -183,8 +194,10 @@ def seed_database():
                 )
                 db.add(s)
                 sensor_count += 1
+                print(f"      创建传感器 {sensor_count}/{total_sensors}: {s.name}")
         db.flush()
-        print(f"      ✅ 创建了 {len(stations)} 个调压站，{sensor_count} 个传感器")
+        db.commit()
+        print(f"      ✅ 创建了 {len(stations)} 个调压站，{sensor_count} 个传感器 - 已提交")
 
         print("[6/7] 创建气价、供应商和库存...")
         base_date = date.today().replace(month=1, day=1)
@@ -196,8 +209,9 @@ def seed_database():
             GasPriceTier(tier=3, name="第三阶梯(600+)", min_volume=Decimal("600"), max_volume=None,
                          unit_price=Decimal("4.23"), effective_date=base_date, is_active=True),
         ]
-        for t in tiers:
+        for i, t in enumerate(tiers):
             db.add(t)
+            print(f"      创建气价 {i + 1}/{len(tiers)}: {t.name}")
 
         suppliers = [
             GasSupplier(name="中石油天然气有限公司", code="CNPC-001", contact_person="张经理",
@@ -207,8 +221,9 @@ def seed_database():
                         phone="010-87654321", rating=4, is_active=True,
                         address="北京市海淀区中关村大街1号", created_at=datetime.utcnow()),
         ]
-        for s in suppliers:
+        for i, s in enumerate(suppliers):
             db.add(s)
+            print(f"      创建供应商 {i + 1}/{len(suppliers)}: {s.name}")
 
         inventory_points = [
             GasInventory(storage_point="一号储气库(北郊)", current_volume=Decimal("15000"),
@@ -218,10 +233,12 @@ def seed_database():
                          min_threshold=Decimal("4000"), max_capacity=Decimal("25000"),
                          last_updated=datetime.utcnow()),
         ]
-        for inv in inventory_points:
+        for i, inv in enumerate(inventory_points):
             db.add(inv)
+            print(f"      创建库存点 {i + 1}/{len(inventory_points)}: {inv.storage_point}")
         db.flush()
-        print(f"      ✅ 创建了 {len(tiers)} 级气价，{len(suppliers)} 供应商，{len(inventory_points)} 库存点")
+        db.commit()
+        print(f"      ✅ 创建了 {len(tiers)} 级气价，{len(suppliers)} 供应商，{len(inventory_points)} 库存点 - 已提交")
 
         print("[7/7] 创建居民账户...")
         resident_users = [u for u in users if u.role == UserRole.RESIDENT]
@@ -239,17 +256,54 @@ def seed_database():
                 meter_no=f"M{area.code}{10000 + i:06d}",
                 meter_reading=Decimal(str(500 + i * 23.5)),
                 last_reading_date=first_day - timedelta(days=1),
-                longitude=Decimal(str(float(area.longitude) + (i % 5) * 0.001))[:10],
-                latitude=Decimal(str(float(area.latitude) + (i % 5) * 0.001))[:10],
-                gas_status=GasStatus.NORMAL.value,
+                longitude=Decimal(str(float(area.longitude) + (i % 5) * 0.001)[:10]),
+                latitude=Decimal(str(float(area.latitude) + (i % 5) * 0.001)[:10]),
+                gas_status=GasStatus.NORMAL,
                 tier_level=1,
                 created_at=datetime.utcnow()
             )
             db.add(acc)
             created_accounts += 1
-
+            print(f"      创建居民账户 {created_accounts}/{len(resident_users)}: {acc.account_no} ({acc.resident_name})")
+        db.flush()
         db.commit()
-        print(f"      ✅ 创建了 {created_accounts} 个居民账户")
+        print(f"      ✅ 创建了 {created_accounts} 个居民账户 - 已提交")
+
+        print("\n" + "=" * 60)
+        print("🔍 开始验证数据...")
+        print("=" * 60)
+
+        user_count = db.execute(select(func.count()).select_from(User.__table__)).scalar()
+        area_count = db.execute(select(func.count()).select_from(Area.__table__)).scalar()
+        team_count = db.execute(select(func.count()).select_from(MaintenanceTeam.__table__)).scalar()
+        station_count = db.execute(select(func.count()).select_from(PressureStation.__table__)).scalar()
+        sensor_count = db.execute(select(func.count()).select_from(Sensor.__table__)).scalar()
+        tier_count = db.execute(select(func.count()).select_from(GasPriceTier.__table__)).scalar()
+        supplier_count = db.execute(select(func.count()).select_from(GasSupplier.__table__)).scalar()
+        inventory_count = db.execute(select(func.count()).select_from(GasInventory.__table__)).scalar()
+        account_count = db.execute(select(func.count()).select_from(ResidentAccount.__table__)).scalar()
+
+        normal_status_count = db.execute(
+            select(func.count()).select_from(ResidentAccount.__table__)
+            .where(ResidentAccount.gas_status == GasStatus.NORMAL)
+        ).scalar()
+
+        print(f"\n📊 数据库验证结果:")
+        print(f"  User 表:           {user_count} 条 ✅" if user_count > 0 else f"  User 表:           {user_count} 条 ❌")
+        print(f"  Area 表:           {area_count} 条 ✅" if area_count > 0 else f"  Area 表:           {area_count} 条 ❌")
+        print(f"  MaintenanceTeam 表: {team_count} 条 ✅" if team_count > 0 else f"  MaintenanceTeam 表: {team_count} 条 ❌")
+        print(f"  PressureStation 表: {station_count} 条 ✅" if station_count > 0 else f"  PressureStation 表: {station_count} 条 ❌")
+        print(f"  Sensor 表:         {sensor_count} 条 ✅" if sensor_count > 0 else f"  Sensor 表:         {sensor_count} 条 ❌")
+        print(f"  GasPriceTier 表:   {tier_count} 条 ✅" if tier_count > 0 else f"  GasPriceTier 表:   {tier_count} 条 ❌")
+        print(f"  GasSupplier 表:    {supplier_count} 条 ✅" if supplier_count > 0 else f"  GasSupplier 表:    {supplier_count} 条 ❌")
+        print(f"  GasInventory 表:   {inventory_count} 条 ✅" if inventory_count > 0 else f"  GasInventory 表:   {inventory_count} 条 ❌")
+        print(f"  ResidentAccount 表: {account_count} 条 ✅" if account_count > 0 else f"  ResidentAccount 表: {account_count} 条 ❌")
+        print(f"\n🔍 gas_status 验证:")
+        print(f"  gas_status = NORMAL 的居民账户: {normal_status_count} 条")
+        if normal_status_count == account_count and account_count > 0:
+            print(f"  ✅ 所有居民账户的 gas_status 都正确设置为 NORMAL")
+        else:
+            print(f"  ❌ gas_status 存在异常，期望 {account_count} 条 NORMAL，实际 {normal_status_count} 条")
 
         print("\n" + "=" * 60)
         print("🎉 数据库初始化全部完成！")

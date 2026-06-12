@@ -83,6 +83,35 @@ async def approve_stage(
     status: ApprovalStatus,
     comment: Optional[str] = None
 ) -> ApprovalRecord:
+    stages_order = [
+        ApprovalStage.SAFETY,
+        ApprovalStage.DESIGN,
+        ApprovalStage.ENGINEERING,
+        ApprovalStage.FINAL
+    ]
+
+    project_result = await db.execute(
+        select(EngineeringProject).where(EngineeringProject.id == project_id)
+    )
+    project = project_result.scalar_one_or_none()
+    if not project:
+        raise ValueError("工程项目不存在")
+
+    current_idx = stages_order.index(stage)
+    if current_idx > 0:
+        prev_stage = stages_order[current_idx - 1]
+        prev_result = await db.execute(
+            select(ApprovalRecord).where(
+                and_(
+                    ApprovalRecord.project_id == project_id,
+                    ApprovalRecord.stage == prev_stage
+                )
+            )
+        )
+        prev_record = prev_result.scalar_one_or_none()
+        if not prev_record or prev_record.status != ApprovalStatus.APPROVED:
+            raise ValueError(f"上一阶段 {prev_stage.value} 未通过，不能审批当前阶段")
+
     result = await db.execute(
         select(ApprovalRecord).where(
             and_(
@@ -93,28 +122,16 @@ async def approve_stage(
     )
     record = result.scalar_one_or_none()
     if not record:
-        raise ValueError(f"Approval record not found for stage: {stage}")
+        raise ValueError(f"审批记录不存在: {stage}")
+
+    if record.status != ApprovalStatus.PENDING:
+        raise ValueError(f"当前阶段 {stage.value} 已被处理，不能重复审批")
 
     record.approver_id = approver_id
     record.status = status
     record.comment = comment
     record.approved_at = datetime.utcnow()
     await db.flush()
-
-    project_result = await db.execute(
-        select(EngineeringProject).where(EngineeringProject.id == project_id)
-    )
-    project = project_result.scalar_one_or_none()
-    if not project:
-        await db.flush()
-        return record
-
-    stages_order = [
-        ApprovalStage.SAFETY,
-        ApprovalStage.DESIGN,
-        ApprovalStage.ENGINEERING,
-        ApprovalStage.FINAL
-    ]
 
     stage_role_map = {
         ApprovalStage.SAFETY: UserRole.SAFETY_INSPECTOR,
